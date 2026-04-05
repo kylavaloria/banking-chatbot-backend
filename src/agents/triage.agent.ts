@@ -1,59 +1,32 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Triage Agent — Deterministic Rule-Based Implementation (Phase 2, Slice 1)
-// Scope: single operational issue only.
-// Multi-issue and hybrid triage are out of scope for this slice.
+// Triage Agent — Slice 4: Hybrid (LLM signal extraction + deterministic matrix)
 //
 // Execution order:
-//   1. Extract triage signals from IntentResult
-//   2. Apply importance rules
-//   3. Apply urgency rules
-//   4. Run priority matrix (Importance × Urgency)
-//   5. Apply P1 override rules (unconditional)
-//   6. Derive recommended_path from final priority
-//   7. Return TriageResult
-//
-// The LLM hook point for signal extraction is marked TODO: LLM_HOOK.
+//   1. Try LLM signal extraction (Groq 8b)
+//   2. On failure, use rule-based signal extraction
+//   3. Deterministic matrix + P1 overrides (always authoritative)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { IntentResult, OperationalIntentType } from '../contracts/intent.contract';
 import type {
-  TriageSignals,
-  TriageResult,
-  Importance,
-  Urgency,
-  Priority,
-  RecommendedPath,
-  TriageOverrideReason,
+  TriageSignals, TriageResult, Importance, Urgency,
+  Priority, RecommendedPath, TriageOverrideReason,
 } from '../contracts/triage.contract';
 
-// ---------------------------------------------------------------------------
-// Intents that carry an inherent fraud / high-risk signal
-// ---------------------------------------------------------------------------
-
-const FRAUD_INTENTS = new Set<OperationalIntentType>([
-  'unauthorized_transaction',
-  'lost_or_stolen_card',
-]);
-
-const NO_FUNDS_ACCESS_INTENTS = new Set<OperationalIntentType>([
-  'account_access_issue',
-  'account_restriction_issue',
-]);
-
-const ACCOUNT_COMPROMISE_INTENTS = new Set<OperationalIntentType>([
-  'unauthorized_transaction',
-  'account_restriction_issue',
-]);
+import { callGroq }             from '../llm/groq.client';
+import { extractJSON }          from '../utils/json-extract';
+import { buildTriageMessages }  from '../llm/prompts/triage.prompt';
+import { env }                  from '../config/env';
 
 // ---------------------------------------------------------------------------
-// Intents mapped to their baseline importance and urgency
-// Used in Step 2 and Step 3 before context upgrades are applied.
+// Baseline signals per intent (rule-based fallback data)
 // ---------------------------------------------------------------------------
 
-interface BaselineSignal {
-  importance: Importance;
-  urgency: Urgency;
-}
+const FRAUD_INTENTS           = new Set<OperationalIntentType>(['unauthorized_transaction', 'lost_or_stolen_card']);
+const NO_FUNDS_ACCESS_INTENTS = new Set<OperationalIntentType>(['account_access_issue', 'account_restriction_issue']);
+const ACCOUNT_COMPROMISE_INTENTS = new Set<OperationalIntentType>(['unauthorized_transaction', 'account_restriction_issue']);
+
+interface BaselineSignal { importance: Importance; urgency: Urgency; }
 
 const INTENT_BASELINE: Partial<Record<OperationalIntentType, BaselineSignal>> = {
   unauthorized_transaction:         { importance: 'high',   urgency: 'high'   },
@@ -69,18 +42,7 @@ const INTENT_BASELINE: Partial<Record<OperationalIntentType, BaselineSignal>> = 
 };
 
 // ---------------------------------------------------------------------------
-// Priority matrix: Importance × Urgency → Priority
-// SRS §3.2.2 Priority Matrix
-//
-//              Urgency
-//              low    medium  high
-// Importance
-//   low        P4     P3      P2
-//   medium     P3     P2      P1
-//   high       P2     P1      P1
-//
-// Note: P4 is mapped to P3 here because tracked operational cases
-// always produce at minimum a P3 ticket (SRS CON-05).
+// Priority matrix
 // ---------------------------------------------------------------------------
 
 const PRIORITY_MATRIX: Record<Importance, Record<Urgency, Priority>> = {
@@ -90,189 +52,133 @@ const PRIORITY_MATRIX: Record<Importance, Record<Urgency, Priority>> = {
 };
 
 const PATH_BY_PRIORITY: Record<Priority, RecommendedPath> = {
-  P1: 'live_escalation',
-  P2: 'urgent_ticket',
-  P3: 'standard_ticket',
-  P4: 'self_service',
+  P1: 'live_escalation', P2: 'urgent_ticket',
+  P3: 'standard_ticket', P4: 'self_service',
 };
 
 // ---------------------------------------------------------------------------
-// Step 1: Extract triage signals from IntentResult
-//
-// TODO: LLM_HOOK — Replace this function with an LLM call that receives
-// the user message + IntentResult and returns a structured TriageSignals
-// JSON. Run the returned signals through the same priority matrix and
-// override rules below. The matrix and overrides are never delegated to
-// the LLM.
+// Rule-based signal extraction (fallback)
 // ---------------------------------------------------------------------------
 
-function extractSignals(intentResult: IntentResult): { signals: TriageSignals; evidence: string[] } {
-  const evidence: string[] = [];
+function extractSignalsRuleBased(
+  intentResult: IntentResult,
+  evidence: string[]
+): TriageSignals {
   const intentType = intentResult.intent_type as OperationalIntentType;
-  const entities = intentResult.entities;
+  const entities   = intentResult.entities;
 
-  const active_fraud_signal = FRAUD_INTENTS.has(intentType);
-  const account_compromise_signal = ACCOUNT_COMPROMISE_INTENTS.has(intentType);
-  const access_to_funds_blocked = NO_FUNDS_ACCESS_INTENTS.has(intentType);
+  const active_fraud_signal      = FRAUD_INTENTS.has(intentType);
+  const account_compromise_signal= ACCOUNT_COMPROMISE_INTENTS.has(intentType);
+  const access_to_funds_blocked  = NO_FUNDS_ACCESS_INTENTS.has(intentType);
+  const HIGH_VALUE_THRESHOLD     = 10_000;
+  const high_value_amount        = typeof entities.amount === 'number' && entities.amount >= HIGH_VALUE_THRESHOLD;
+  const multiple_transactions    = false;
+  const aging_signal             = entities.date_reference !== null || (typeof entities.urgency_cue === 'string' && entities.urgency_cue.length > 0);
+  const urgency_language: 'low' | 'medium' | 'high' = entities.urgency_cue ? 'high' : 'low';
+  const financial_impact: 'low' | 'medium' | 'high' = high_value_amount ? 'high' : (typeof entities.amount === 'number' && entities.amount > 0 ? 'medium' : 'low');
 
-  // Amount threshold: treat amounts above this as high-value (configurable)
-  const HIGH_VALUE_THRESHOLD = 10_000;
-  const high_value_amount =
-    typeof entities.amount === 'number' && entities.amount >= HIGH_VALUE_THRESHOLD;
+  if (active_fraud_signal)        evidence.push(`[rule] Fraud signal: ${intentType}`);
+  if (account_compromise_signal)  evidence.push(`[rule] Account compromise: ${intentType}`);
+  if (access_to_funds_blocked)    evidence.push(`[rule] No funds access: ${intentType}`);
+  if (high_value_amount)          evidence.push(`[rule] High-value amount: ${entities.amount}`);
+  if (aging_signal)               evidence.push(`[rule] Aging signal detected`);
 
-  const multiple_transactions = false; // Rule-based cannot detect this; LLM hook needed
-
-  // Aging signal: inferred from date reference or urgency cue
-  const aging_signal =
-    entities.date_reference !== null ||
-    (typeof entities.urgency_cue === 'string' && entities.urgency_cue.length > 0);
-
-  // Urgency language
-  const urgencyLanguage: 'low' | 'medium' | 'high' =
-    entities.urgency_cue !== null ? 'high' : 'low';
-
-  // Financial impact from amount
-  const financialImpact: 'low' | 'medium' | 'high' =
-    high_value_amount ? 'high'
-    : typeof entities.amount === 'number' && entities.amount > 0 ? 'medium'
-    : 'low';
-
-  if (active_fraud_signal)        evidence.push(`Fraud signal: intent_type=${intentType}`);
-  if (account_compromise_signal)  evidence.push(`Account compromise signal: intent_type=${intentType}`);
-  if (access_to_funds_blocked)    evidence.push(`No funds access signal: intent_type=${intentType}`);
-  if (high_value_amount)          evidence.push(`High-value amount: ${entities.amount}`);
-  if (aging_signal)               evidence.push(`Aging signal: date_reference="${entities.date_reference}" urgency_cue="${entities.urgency_cue}"`);
-  if (urgencyLanguage === 'high') evidence.push(`Urgency cue present: "${entities.urgency_cue}"`);
-
-  const signals: TriageSignals = {
-    active_fraud_signal,
-    account_compromise_signal,
-    access_to_funds_blocked,
-    multiple_transactions,
-    high_value_amount,
-    aging_signal,
-    urgency_language: urgencyLanguage,
-    financial_impact: financialImpact,
-    evidence,
+  return {
+    active_fraud_signal, account_compromise_signal, access_to_funds_blocked,
+    multiple_transactions, high_value_amount, aging_signal,
+    urgency_language, financial_impact, evidence,
   };
-
-  return { signals, evidence };
 }
 
 // ---------------------------------------------------------------------------
-// Step 2: Compute importance from signals and intent baseline
+// LLM signal extraction
 // ---------------------------------------------------------------------------
 
-function computeImportance(
-  signals: TriageSignals,
-  intentType: OperationalIntentType,
+async function extractSignalsLLM(
+  userMessage: string,
+  intentResult: IntentResult,
   evidence: string[]
-): Importance {
-  const baseline = INTENT_BASELINE[intentType];
-  let importance: Importance = baseline?.importance ?? 'low';
+): Promise<TriageSignals | null> {
+  try {
+    const messages = buildTriageMessages(userMessage, intentResult);
 
-  // Context upgrades — apply the highest applicable level
-  if (signals.active_fraud_signal || signals.account_compromise_signal) {
-    if (importance !== 'high') {
-      evidence.push(`Importance upgraded to high: fraud/compromise signal`);
+    const llmResponse = await callGroq({
+      messages,
+      model:       env.TRIAGE_MODEL,
+      temperature: 0.1,
+      maxTokens:   512,
+    });
+
+    const parsed = extractJSON(llmResponse.text);
+    if (!parsed) {
+      console.warn('[TriageAgent] Unparseable LLM signal output');
+      return null;
     }
+
+    // Validate and normalize signal fields
+    const safeBool = (v: unknown) => typeof v === 'boolean' ? v : false;
+    const safeLevel = (v: unknown, fallback: 'low' | 'medium' | 'high'): 'low' | 'medium' | 'high' => {
+      if (v === 'high' || v === 'medium' || v === 'low') return v;
+      return fallback;
+    };
+
+    const signals: TriageSignals = {
+      active_fraud_signal:       safeBool(parsed['active_fraud_signal']),
+      account_compromise_signal: safeBool(parsed['account_compromise_signal']),
+      access_to_funds_blocked:   safeBool(parsed['access_to_funds_blocked']),
+      multiple_transactions:     safeBool(parsed['multiple_transactions']),
+      high_value_amount:         safeBool(parsed['high_value_amount']),
+      aging_signal:              safeBool(parsed['aging_signal']),
+      urgency_language:          safeLevel(parsed['urgency_language'], 'low'),
+      financial_impact:          safeLevel(parsed['financial_impact'], 'low'),
+      evidence: Array.isArray(parsed['evidence'])
+        ? parsed['evidence'].filter((e): e is string => typeof e === 'string').map(e => `[llm] ${e}`)
+        : ['[llm] Signal extraction complete'],
+      raw_llm_output: { model: llmResponse.model_used, usage: llmResponse.usage },
+    };
+
+    evidence.push(...signals.evidence);
+    return signals;
+  } catch (err) {
+    console.warn('[TriageAgent] LLM signal extraction failed', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic matrix + overrides (always authoritative)
+// ---------------------------------------------------------------------------
+
+function computeImportance(signals: TriageSignals, intentType: OperationalIntentType, evidence: string[]): Importance {
+  let importance: Importance = INTENT_BASELINE[intentType]?.importance ?? 'low';
+  if (signals.active_fraud_signal || signals.account_compromise_signal || signals.access_to_funds_blocked) {
+    if (importance !== 'high') evidence.push(`Importance upgraded to high: critical signal`);
     importance = 'high';
   }
-
-  if (signals.access_to_funds_blocked) {
-    if (importance !== 'high') {
-      evidence.push(`Importance upgraded to high: no access to funds`);
-    }
-    importance = 'high';
-  }
-
-  if (signals.high_value_amount && importance === 'low') {
-    importance = 'medium';
-    evidence.push(`Importance upgraded to medium: high-value amount`);
-  }
-
-  if (signals.multiple_transactions && importance !== 'high') {
-    importance = 'high';
-    evidence.push(`Importance upgraded to high: multiple transactions affected`);
-  }
-
-  evidence.push(`Final importance: ${importance} (baseline from ${intentType})`);
+  if (signals.high_value_amount && importance === 'low') { importance = 'medium'; evidence.push(`Importance upgraded to medium: high-value`); }
+  if (signals.multiple_transactions && importance !== 'high') { importance = 'high'; evidence.push(`Importance upgraded to high: multiple transactions`); }
+  evidence.push(`Final importance: ${importance}`);
   return importance;
 }
 
-// ---------------------------------------------------------------------------
-// Step 3: Compute urgency from signals and intent baseline
-// ---------------------------------------------------------------------------
-
-function computeUrgency(
-  signals: TriageSignals,
-  intentType: OperationalIntentType,
-  evidence: string[]
-): Urgency {
-  const baseline = INTENT_BASELINE[intentType];
-  let urgency: Urgency = baseline?.urgency ?? 'low';
-
-  if (signals.active_fraud_signal || signals.access_to_funds_blocked) {
-    if (urgency !== 'high') {
-      evidence.push(`Urgency upgraded to high: fraud or funds access blocked`);
-    }
-    urgency = 'high';
-  }
-
-  if (signals.urgency_language === 'high' && urgency === 'low') {
-    urgency = 'medium';
-    evidence.push(`Urgency upgraded to medium: urgency language detected`);
-  }
-
-  if (signals.aging_signal && urgency === 'low') {
-    urgency = 'medium';
-    evidence.push(`Urgency upgraded to medium: aging or date reference detected`);
-  }
-
-  evidence.push(`Final urgency: ${urgency} (baseline from ${intentType})`);
+function computeUrgency(signals: TriageSignals, intentType: OperationalIntentType, evidence: string[]): Urgency {
+  let urgency: Urgency = INTENT_BASELINE[intentType]?.urgency ?? 'low';
+  if (signals.active_fraud_signal || signals.access_to_funds_blocked) { if (urgency !== 'high') evidence.push(`Urgency upgraded to high: fraud/funds`); urgency = 'high'; }
+  if (signals.urgency_language === 'high' && urgency === 'low') { urgency = 'medium'; evidence.push(`Urgency upgraded to medium: urgency language`); }
+  if (signals.aging_signal && urgency === 'low') { urgency = 'medium'; evidence.push(`Urgency upgraded to medium: aging`); }
+  evidence.push(`Final urgency: ${urgency}`);
   return urgency;
 }
-
-// ---------------------------------------------------------------------------
-// Step 4: Priority matrix lookup
-// ---------------------------------------------------------------------------
-
-function applyPriorityMatrix(
-  importance: Importance,
-  urgency: Urgency,
-  evidence: string[]
-): Priority {
-  const priority = PRIORITY_MATRIX[importance][urgency];
-  evidence.push(`Priority matrix (${importance} × ${urgency}) → ${priority}`);
-  return priority;
-}
-
-// ---------------------------------------------------------------------------
-// Step 5: P1 override rules (unconditional — SRS FR-TRI-09)
-// These fire regardless of the matrix result.
-// ---------------------------------------------------------------------------
 
 function applyOverrides(
   matrixPriority: Priority,
   signals: TriageSignals,
   evidence: string[]
 ): { priority: Priority; overrideReason: TriageOverrideReason } {
-  if (signals.active_fraud_signal) {
-    evidence.push(`P1 override applied: fraud_override (active_fraud_signal=true)`);
-    return { priority: 'P1', overrideReason: 'fraud_override' };
-  }
-
-  if (signals.account_compromise_signal) {
-    evidence.push(`P1 override applied: account_compromise_override`);
-    return { priority: 'P1', overrideReason: 'account_compromise_override' };
-  }
-
-  if (signals.access_to_funds_blocked) {
-    evidence.push(`P1 override applied: no_access_to_funds_override`);
-    return { priority: 'P1', overrideReason: 'no_access_to_funds_override' };
-  }
-
-  evidence.push(`No override applied; matrix priority ${matrixPriority} stands`);
+  if (signals.active_fraud_signal)        { evidence.push('P1 override: fraud');           return { priority: 'P1', overrideReason: 'fraud_override' }; }
+  if (signals.account_compromise_signal)  { evidence.push('P1 override: compromise');      return { priority: 'P1', overrideReason: 'account_compromise_override' }; }
+  if (signals.access_to_funds_blocked)    { evidence.push('P1 override: no funds access'); return { priority: 'P1', overrideReason: 'no_access_to_funds_override' }; }
+  evidence.push(`No override; matrix priority ${matrixPriority} stands`);
   return { priority: matrixPriority, overrideReason: 'none' };
 }
 
@@ -280,44 +186,49 @@ function applyOverrides(
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Computes a deterministic TriageResult for a single operational concern.
- *
- * Must only be called when intent_group = 'operational'.
- * Informational, clarification, and refusal branches bypass Triage.
- */
+
 export function triageIntent(intentResult: IntentResult): TriageResult {
   const intentType = intentResult.intent_type as OperationalIntentType;
-  const evidence: string[] = [];
-
-  evidence.push(`Triaging intent: ${intentType}`);
-
-  // Step 1: Extract signals
-  const { signals, evidence: signalEvidence } = extractSignals(intentResult);
-  evidence.push(...signalEvidence);
-
-  // Step 2: Importance
+  const evidence: string[] = [`[sync] Triaging: ${intentType}`];
+  const signals    = extractSignalsRuleBased(intentResult, evidence);
   const importance = computeImportance(signals, intentType, evidence);
+  const urgency    = computeUrgency(signals, intentType, evidence);
+  const matrix     = PRIORITY_MATRIX[importance][urgency];
+  const { priority, overrideReason } = applyOverrides(matrix, signals, evidence);
+  return {
+    importance, urgency, priority,
+    recommended_path: PATH_BY_PRIORITY[priority],
+    override_reason:  overrideReason,
+    evidence,
+  };
+}
 
-  // Step 3: Urgency
-  const urgency = computeUrgency(signals, intentType, evidence);
+export async function triageIntentAsync(
+  intentResult: IntentResult,
+  userMessage:  string
+): Promise<TriageResult> {
+  const intentType = intentResult.intent_type as OperationalIntentType;
+  const evidence: string[] = [`Triaging: ${intentType}`];
 
-  // Step 4: Matrix
-  const matrixPriority = applyPriorityMatrix(importance, urgency, evidence);
+  let signals: TriageSignals | null = null;
+  if (env.NODE_ENV !== 'test') {
+    signals = await extractSignalsLLM(userMessage, intentResult, evidence);
+  }
 
-  // Step 5: Overrides
-  const { priority, overrideReason } = applyOverrides(matrixPriority, signals, evidence);
+  if (!signals) {
+    evidence.push('[fallback] Using rule-based signal extraction');
+    signals = extractSignalsRuleBased(intentResult, evidence);
+  }
 
-  // Step 6: Path
-  const recommendedPath: RecommendedPath = PATH_BY_PRIORITY[priority];
-  evidence.push(`Recommended path: ${recommendedPath}`);
+  const importance = computeImportance(signals, intentType, evidence);
+  const urgency    = computeUrgency(signals, intentType, evidence);
+  const matrix     = PRIORITY_MATRIX[importance][urgency];
+  const { priority, overrideReason } = applyOverrides(matrix, signals, evidence);
 
   return {
-    importance,
-    urgency,
-    priority,
-    recommended_path: recommendedPath,
-    override_reason: overrideReason,
+    importance, urgency, priority,
+    recommended_path: PATH_BY_PRIORITY[priority],
+    override_reason:  overrideReason,
     evidence,
   };
 }

@@ -1,33 +1,32 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Response Agent — Slice 1 + Slice 2 + Slice 3
-// Slice 3 additions:
-//   - renderMultiIssueConfirmation
-//   - renderHybridResponse (informational + operational combined)
-//   - topic-switch wording in renderTicketConfirmation / renderCritical
+// Response Agent — Slice 4: Gemini Flash with template fallback
+// generateResponse is now async.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { ActionResult }          from '../contracts/action.contract';
-import type { IntentResult }          from '../contracts/intent.contract';
-import type { TriageResult }          from '../contracts/triage.contract';
-import type { ResponseInput }         from '../contracts/response.contract';
-import type { PolicyOutput }          from './policy.agent';
-import type { ClarificationContext }  from './intent.agent';
+import type { ActionResult }         from '../contracts/action.contract';
+import type { IntentResult }         from '../contracts/intent.contract';
+import type { TriageResult }         from '../contracts/triage.contract';
+import type { ResponseInput }        from '../contracts/response.contract';
+import type { PolicyOutput }         from './policy.agent';
+import type { ClarificationContext } from './intent.agent';
+
+import { callGemini }              from '../llm/gemini.client';
+import { buildResponseMessages }   from '../llm/prompts/response.prompt';
+import { env }                     from '../config/env';
 
 export interface ResponseAgentInput {
-  actionResult:          ActionResult;
-  intentResult:          IntentResult;
-  triageResult?:         TriageResult;
-  policyOutput:          PolicyOutput;
-  clarificationContext?: ClarificationContext | null;
-  cardBlockOutcome?:     'confirmed' | 'declined' | null;
-  /** Slice 3: pre-fetched informational answer for the hybrid informational branch */
-  hybridInformationalAnswer?: string | null;
-  /** Slice 3: true when a topic switch caused a new case to be opened */
-  topicSwitched?: boolean;
+  actionResult:              ActionResult;
+  intentResult:              IntentResult;
+  triageResult?:             TriageResult;
+  policyOutput:              PolicyOutput;
+  clarificationContext?:     ClarificationContext | null;
+  cardBlockOutcome?:         'confirmed' | 'declined' | null;
+  hybridInformationalAnswer?:string | null;
+  topicSwitched?:            boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Step 1: Build ResponseInput
+// ResponseInput builder (unchanged from Slice 3)
 // ---------------------------------------------------------------------------
 
 function buildActionsTakenList(actionResult: ActionResult, topicSwitched?: boolean): string[] {
@@ -46,13 +45,12 @@ function buildActionsTakenList(actionResult: ActionResult, topicSwitched?: boole
     case 'multi_issue_confirmation': {
       const count = actionResult.created_ticket_ids?.length ?? 0;
       return [
-        `A support case has been opened for your concerns.`,
+        'A support case has been opened for your concerns.',
         `${count} separate support ticket${count !== 1 ? 's have' : ' has'} been created — one for each concern.`,
         'Each concern will be handled by the appropriate team.',
       ];
     }
-    default:
-      return [];
+    default: return [];
   }
 }
 
@@ -76,9 +74,7 @@ function buildNextStep(
       return 'Let us know if you have any other questions — we are here to help.';
     case 'clarification': {
       const turn = clarificationContext?.turnCount ?? 0;
-      return turn >= 2
-        ? 'Please take your time — any detail will help us assist you correctly.'
-        : 'Your response will help us direct your concern to the right team right away.';
+      return turn >= 2 ? 'Please take your time — any detail will help us assist you correctly.' : 'Your response will help us direct your concern to the right team right away.';
     }
     case 'refusal':
       return 'If you have a banking or account-related concern, please describe it and we will be glad to assist.';
@@ -89,10 +85,9 @@ function buildNextStep(
 
 function buildResponseInput(input: ResponseAgentInput): ResponseInput {
   const { actionResult, intentResult, triageResult, policyOutput, clarificationContext, topicSwitched } = input;
-  const mode          = actionResult.response_mode;
+  const mode = actionResult.response_mode;
   const intentLabel   = intentResult.intent_type.replace(/_/g, ' ');
   const intentSummary = intentResult.issue_components[0]?.summary ?? `Your concern regarding ${intentLabel}`;
-
   return {
     response_mode:             mode,
     intent_summary:            intentSummary,
@@ -108,156 +103,110 @@ function buildResponseInput(input: ResponseAgentInput): ResponseInput {
 }
 
 // ---------------------------------------------------------------------------
-// Templates
+// Template renderer (Slice 3 — used as fallback)
 // ---------------------------------------------------------------------------
 
-function renderInformational(input: ResponseInput): string {
-  const answer = input.informational_answer ?? 'We have noted your inquiry and will provide the relevant information.';
-  return [`Thank you for reaching out.`, ``, answer, ``, input.next_step].join('\n');
-}
-
-function renderClarification(input: ResponseInput): string {
-  const question = input.clarification_question ?? 'Could you please provide more details about your concern?';
-  return [
-    `Thank you for getting in touch.`, ``,
-    `To make sure we assist you in the best way possible, we have a quick question:`, ``,
-    question, ``, input.next_step,
-  ].join('\n');
-}
-
-function renderTicketConfirmation(input: ResponseInput, topicSwitched?: boolean): string {
-  const actionLines = input.actions_taken.map((a: string) => `• ${a}`).join('\n');
-  const topicNote   = topicSwitched
-    ? `\n\nWe noticed this is a different concern from your previous case. We have opened a new case for this issue.`
-    : '';
-  return [
-    `Thank you for bringing this to our attention. We have received your concern regarding:`, ``,
-    `"${input.intent_summary}"`,
-    topicNote, ``,
-    `Here is what we have done:`, actionLines, ``, input.next_step,
-  ].join('\n');
-}
-
-function renderCriticalActionConfirmation(input: ResponseInput, topicSwitched?: boolean): string {
-  const actionLines = input.actions_taken.map((a: string) => `• ${a}`).join('\n');
-  const topicNote   = topicSwitched
-    ? `\n\nThis is being treated as a new case separate from any previous concern.`
-    : '';
-  const cardBlockSection = input.card_block_offered
-    ? `\n\nFor your protection, we would also like to place a temporary block on your card while we investigate. Please reply with YES to confirm the block, or NO to keep your card active.`
-    : '';
-  return [
-    `We have received your report and your case has been given the highest priority.`, ``,
-    `Regarding your concern:`,
-    `"${input.intent_summary}"`,
-    topicNote, ``,
-    `Here is what we have done:`, actionLines,
-    cardBlockSection, ``, input.next_step,
-  ].join('\n');
-}
-
-function renderMultiIssueConfirmation(
+function renderTemplate(
   input: ResponseInput,
-  actionResult: ActionResult
+  extra: { cardBlockOutcome?: 'confirmed' | 'declined' | null; hybridAnswer?: string | null; topicSwitched?: boolean; actionResult: ActionResult }
 ): string {
-  const actionLines  = input.actions_taken.map((a: string) => `• ${a}`).join('\n');
-  const ticketCount  = actionResult.created_ticket_ids?.length ?? 0;
-  return [
-    `Thank you for reaching out. We have received your message and identified ${ticketCount} separate concern${ticketCount !== 1 ? 's' : ''}.`, ``,
-    `Here is what we have done:`, actionLines, ``,
-    `Each concern is being tracked independently so our team can address them separately.`, ``,
-    input.next_step,
-  ].join('\n');
-}
-
-function renderHybridResponse(
-  input: ResponseInput,
-  hybridAnswer: string,
-  actionResult: ActionResult
-): string {
-  const actionLines = input.actions_taken.map((a: string) => `• ${a}`).join('\n');
-  return [
-    `Thank you for your message. We have noted two parts to your inquiry:`, ``,
-    `**Regarding your question:**`,
-    hybridAnswer, ``,
-    `**Regarding your concern:**`,
-    `"${input.intent_summary}"`, ``,
-    `Here is what we have done:`, actionLines, ``,
-    input.next_step,
-  ].join('\n');
-}
-
-function renderCardBlockConfirmed(): string {
-  return [
-    `Understood. Your card block has been confirmed.`, ``,
-    `Your card has been temporarily blocked to prevent any further unauthorised use. `,
-    `Our team is actively reviewing your case and will follow up with you shortly.`, ``,
-    `If you need to use your card before our team contacts you, please call our support line directly.`,
-  ].join('\n');
-}
-
-function renderCardBlockDeclined(): string {
-  return [
-    `Understood — your card will remain active.`, ``,
-    `Your case has been escalated to our team for urgent review. `,
-    `We will follow up with you as soon as possible.`, ``,
-    `If you change your mind about blocking your card or notice any further suspicious activity, `,
-    `please contact us immediately.`,
-  ].join('\n');
-}
-
-function renderRefusal(input: ResponseInput): string {
-  return [
-    `Thank you for reaching out.`, ``,
-    `We are a dedicated BFSI customer support service and are only able to assist with ` +
-    `banking, financial services, and insurance-related concerns — such as account issues, ` +
-    `transactions, cards, loans, and related inquiries.`, ``,
-    `We are unable to assist with the request you have described.`, ``,
-    input.next_step,
-  ].join('\n');
-}
-
-// ---------------------------------------------------------------------------
-// Dispatch
-// ---------------------------------------------------------------------------
-
-function buildMessage(
-  input: ResponseInput,
-  extra: {
-    cardBlockOutcome?:         'confirmed' | 'declined' | null;
-    hybridInformationalAnswer?: string | null;
-    topicSwitched?:            boolean;
-    actionResult:              ActionResult;
+  if (extra.cardBlockOutcome === 'confirmed') {
+    return ['Understood. Your card block has been confirmed.', '', 'Your card has been temporarily blocked to prevent any further unauthorised use. Our team is actively reviewing your case and will follow up with you shortly.', '', 'If you need to use your card before our team contacts you, please call our support line directly.'].join('\n');
   }
-): string {
-  if (extra.cardBlockOutcome === 'confirmed') return renderCardBlockConfirmed();
-  if (extra.cardBlockOutcome === 'declined')  return renderCardBlockDeclined();
-
-  if (extra.hybridInformationalAnswer && input.response_mode !== 'informational') {
-    return renderHybridResponse(input, extra.hybridInformationalAnswer, extra.actionResult);
+  if (extra.cardBlockOutcome === 'declined') {
+    return ['Understood — your card will remain active.', '', 'Your case has been escalated to our team for urgent review. We will follow up with you as soon as possible.', '', 'If you change your mind about blocking your card or notice any further suspicious activity, please contact us immediately.'].join('\n');
+  }
+  if (extra.hybridAnswer && input.response_mode !== 'informational') {
+    const actionLines = input.actions_taken.map(a => `• ${a}`).join('\n');
+    return [`Thank you for your message. We have noted two parts to your inquiry:`, ``, `Regarding your question:`, extra.hybridAnswer, ``, `Regarding your concern:`, `"${input.intent_summary}"`, ``, `Here is what we have done:`, actionLines, ``, input.next_step].join('\n');
   }
 
   switch (input.response_mode) {
-    case 'informational':               return renderInformational(input);
-    case 'clarification':               return renderClarification(input);
-    case 'ticket_confirmation':         return renderTicketConfirmation(input, extra.topicSwitched);
-    case 'critical_action_confirmation':return renderCriticalActionConfirmation(input, extra.topicSwitched);
-    case 'multi_issue_confirmation':    return renderMultiIssueConfirmation(input, extra.actionResult);
-    case 'refusal':                     return renderRefusal(input);
-    default:                            return renderClarification(input);
+    case 'informational':
+      return [`Thank you for reaching out.`, ``, input.informational_answer ?? 'We have noted your inquiry.', ``, input.next_step].join('\n');
+    case 'clarification':
+      return [`Thank you for getting in touch.`, ``, `To make sure we assist you in the best way possible, we have a quick question:`, ``, input.clarification_question ?? 'Could you provide more details?', ``, input.next_step].join('\n');
+    case 'ticket_confirmation': {
+      const actionLines = input.actions_taken.map(a => `• ${a}`).join('\n');
+      const topicNote = extra.topicSwitched ? `\n\nWe noticed this is a different concern from your previous case. We have opened a new case for this issue.` : '';
+      return [`Thank you for bringing this to our attention. We have received your concern regarding:`, ``, `"${input.intent_summary}"`, topicNote, ``, `Here is what we have done:`, actionLines, ``, input.next_step].join('\n');
+    }
+    case 'critical_action_confirmation': {
+      const actionLines = input.actions_taken.map(a => `• ${a}`).join('\n');
+      const topicNote = extra.topicSwitched ? `\n\nThis is being treated as a new case separate from any previous concern.` : '';
+      const cardNote  = input.card_block_offered ? `\n\nFor your protection, we would also like to place a temporary block on your card while we investigate. Please reply with YES to confirm the block, or NO to keep your card active.` : '';
+      return [`We have received your report and your case has been given the highest priority.`, ``, `Regarding your concern:`, `"${input.intent_summary}"`, topicNote, ``, `Here is what we have done:`, actionLines, cardNote, ``, input.next_step].join('\n');
+    }
+    case 'multi_issue_confirmation': {
+      const actionLines = input.actions_taken.map(a => `• ${a}`).join('\n');
+      const count = extra.actionResult.created_ticket_ids?.length ?? 0;
+      return [`Thank you for reaching out. We have received your message and identified ${count} separate concern${count !== 1 ? 's' : ''}.`, ``, `Here is what we have done:`, actionLines, ``, `Each concern is being tracked independently so our team can address them separately.`, ``, input.next_step].join('\n');
+    }
+    case 'refusal':
+      return [`Thank you for reaching out.`, ``, `We are a dedicated BFSI customer support service and are only able to assist with banking, financial services, and insurance-related concerns — such as account issues, transactions, cards, loans, and related inquiries.`, ``, `We are unable to assist with the request you have described.`, ``, input.next_step].join('\n');
+    default:
+      return [`Thank you for getting in touch.`, ``, 'Could you please provide more details about your concern?', ``, input.next_step].join('\n');
   }
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// LLM generation
 // ---------------------------------------------------------------------------
 
-export function generateResponse(input: ResponseAgentInput): string {
+async function generateWithLLM(
+  input: ResponseInput,
+  extra: { cardBlockOutcome?: 'confirmed' | 'declined' | null; hybridAnswer?: string | null; topicSwitched?: boolean; ticketCount?: number }
+): Promise<string | null> {
+  try {
+    const messages = buildResponseMessages(input, {
+      hybridInformationalAnswer: extra.hybridAnswer ?? null,
+      topicSwitched:             extra.topicSwitched,
+      ticketCount:               extra.ticketCount,
+      cardBlockOutcome:          extra.cardBlockOutcome,
+    });
+
+    const llmResponse = await callGemini({
+      messages,
+      model:       env.RESPONSE_MODEL,
+      temperature: 0.4,
+      maxTokens:   512,
+    });
+
+    const text = llmResponse.text.trim();
+    if (!text || text.length < 10) {
+      console.warn('[ResponseAgent] Gemini returned empty or too-short response');
+      return null;
+    }
+    return text;
+  } catch (err) {
+    console.warn('[ResponseAgent] Gemini generation failed, using template fallback', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public API — now async
+// ---------------------------------------------------------------------------
+
+export async function generateResponse(input: ResponseAgentInput): Promise<string> {
   const responseInput = buildResponseInput(input);
-  return buildMessage(responseInput, {
-    cardBlockOutcome:          input.cardBlockOutcome,
-    hybridInformationalAnswer: input.hybridInformationalAnswer ?? null,
-    topicSwitched:             input.topicSwitched ?? false,
-    actionResult:              input.actionResult,
-  });
+  const extra = {
+    cardBlockOutcome: input.cardBlockOutcome,
+    hybridAnswer:     input.hybridInformationalAnswer ?? null,
+    topicSwitched:    input.topicSwitched ?? false,
+    actionResult:     input.actionResult,
+    ticketCount:      input.actionResult.created_ticket_ids?.length,
+  };
+
+  // In test environment skip LLM to avoid real API calls
+  if (env.NODE_ENV === 'test') {
+    return renderTemplate(responseInput, extra);
+  }
+
+  // Try LLM generation
+  const llmText = await generateWithLLM(responseInput, extra);
+  if (llmText) return llmText;
+
+  // Fallback to templates
+  return renderTemplate(responseInput, extra);
 }
