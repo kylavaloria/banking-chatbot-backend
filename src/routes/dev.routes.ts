@@ -6,6 +6,7 @@ import { createCase, updateCaseStage } from '../services/case.service';
 import { createTicket } from '../services/ticket.service';
 import { logAction } from '../services/case-action.service';
 import { storeMessage } from '../services/message.service';
+import { serviceClient } from '../config/supabase';
 
 const router = Router();
 
@@ -113,6 +114,31 @@ router.post('/create-demo-case', authMiddleware, async (req: Request, res: Respo
       priority: ticketRecord.ticket_priority,
       stage: 'ticket_created',
     });
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
+  }
+});
+
+/**
+ * POST /api/dev/reset-session
+ * Clears current_case_id on the active session.
+ * Use in tests to isolate session state between test groups.
+ * Remove or gate this before production.
+ */
+router.post('/reset-session', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { authUserId, email } = req.user!;
+    const customer = await resolveCustomer(authUserId, email);
+    const session  = await getOrCreateActiveSession(customer.customer_id);
+
+    const { error } = await serviceClient
+      .from('chat_sessions')
+      .update({ current_case_id: null })
+      .eq('session_id', session.session_id);
+
+    if (error) throw { status: 500, message: 'Failed to reset session.' };
+
+    res.json({ sessionId: session.session_id, currentCaseId: null });
   } catch (err: any) {
     res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
   }

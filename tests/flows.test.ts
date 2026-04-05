@@ -1,6 +1,6 @@
 ﻿/// <reference types="node" />
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 
 const BASE = 'http://localhost:3000';
 
@@ -38,24 +38,27 @@ async function chat(messageText: string): Promise<any> {
   return res.json();
 }
 
+async function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function resetSession(): Promise<void> {
-  await fetch(`${BASE}/api/chat/session`, {
+  await fetch(`${BASE}/api/dev/reset-session`, {
     method:  'POST',
     headers: { 'Authorization': `Bearer ${token}` },
   });
-  await fetch(`${BASE}/api/chat/message`, {
-    method:  'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type':  'application/json',
-    },
-    body: JSON.stringify({ messageText: 'No thank you' }),
-  });
+  // Brief pause so the reset propagates before the next test loads context
+  await sleep(1000);
 }
 
 beforeAll(async () => {
   token = await getToken();
   await resetSession();
+});
+
+// Pause between every test to avoid Groq free-tier TPM limits
+afterEach(async () => {
+  await sleep(6000);
 });
 
 // ---------------------------------------------------------------------------
@@ -104,17 +107,15 @@ describe('Refusal flow', () => {
 
 // ---------------------------------------------------------------------------
 // Clarification flow
-// Reset before this group — the global beforeAll reset may leave an active
-// P1 case that causes the LLM to classify ambiguous messages as operational.
 // ---------------------------------------------------------------------------
 
 describe('Clarification flow', () => {
   beforeAll(async () => {
-    await chat('No thank you');
-  });
+  await resetSession();
+});
 
   it('returns clarification for vague messages', async () => {
-    const result = await chat('Something is wrong with my account');
+    const result = await chat('I have an issue I need help with');
     expect(result.responseMode).toBe('clarification');
     expect(result.caseId).toBeFalsy();
     expect(result.reply).toContain('?');
@@ -129,15 +130,19 @@ describe('Clarification flow', () => {
 
 // ---------------------------------------------------------------------------
 // Standard operational flow (P3)
+// Reset: clears any P1 card-block state left by prior groups
 // ---------------------------------------------------------------------------
 
 describe('Standard operational flow (P3)', () => {
+  beforeAll(async () => {
+    await resetSession();
+  });
+
   it('creates case and ticket for a failed transfer', async () => {
     const result = await chat('My transfer to another bank has not arrived yet');
     expect(result.responseMode).toBe('ticket_confirmation');
     expect(result.caseId).toBeTruthy();
     expect(result.ticketId).toBeTruthy();
-    // LLM wording varies — verify structural outcome not exact template words
     expect(result.reply.length).toBeGreaterThan(20);
   });
 
@@ -161,10 +166,8 @@ describe('P1 critical flow', () => {
     expect(result.responseMode).toBe('critical_action_confirmation');
     expect(result.caseId).toBeTruthy();
     expect(result.ticketId).toBeTruthy();
-    // Honest wording — must NOT imply real-time agent handoff
     expect(result.reply).not.toContain('agent is being connected');
     expect(result.reply).not.toContain('stay available');
-    // LLM wording varies — verify it is substantive
     expect(result.reply.length).toBeGreaterThan(50);
   });
 });
@@ -178,16 +181,20 @@ describe('Card-block offer flow', () => {
     const result = await chat('I lost my debit card and I need to report it immediately');
     expect(result.responseMode).toBe('critical_action_confirmation');
     expect(result.caseId).toBeTruthy();
-    // Card block offer is recorded in case_actions regardless of LLM wording
     expect(result.reply.length).toBeGreaterThan(50);
   });
 });
 
 // ---------------------------------------------------------------------------
 // Multi-issue flow
+// Reset: clears P1 card-block state left by card-block offer test
 // ---------------------------------------------------------------------------
 
 describe('Multi-issue flow', () => {
+  beforeAll(async () => {
+    await resetSession();
+  });
+
   it('creates one case and two tickets for a known multi-issue message', async () => {
     const result = await chat(
       "My card was stolen and there are transactions I don't recognize"
@@ -211,9 +218,14 @@ describe('Multi-issue flow', () => {
 
 // ---------------------------------------------------------------------------
 // Guardrail: no over-splitting
+// Reset: clears any P1 state left by multi-issue tests
 // ---------------------------------------------------------------------------
 
 describe('Guardrail: no over-splitting', () => {
+  beforeAll(async () => {
+    await resetSession();
+  });
+
   it('does not split a single operational message into multi-issue', async () => {
     const result = await chat('My transfer has not arrived yet');
     expect(result.responseMode).toBe('ticket_confirmation');
@@ -255,8 +267,8 @@ describe('Hybrid intent flow', () => {
 
 describe('Topic switch flow', () => {
   beforeAll(async () => {
-    await chat('No thank you');
-  });
+      await resetSession();
+    });
 
   it('creates a new case when the message is clearly a different operational issue', async () => {
     const first = await chat('My transfer to another bank has not arrived yet');

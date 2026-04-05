@@ -19,13 +19,13 @@ export const env = {
 
   // Slice 4: LLM providers
   GROQ_API_KEY:            optionalEnv('GROQ_API_KEY'),
-  GOOGLE_AI_STUDIO_API_KEY:optionalEnv('GOOGLE_AI_STUDIO_API_KEY'),
+  RESPONSE_MODEL:       optionalEnv('RESPONSE_MODEL',        'mistral-small-2506'),
 
   // Model configuration
   PRIMARY_INTENT_MODEL: optionalEnv('PRIMARY_INTENT_MODEL', 'llama-3.3-70b-versatile'),
   FALLBACK_INTENT_MODEL:optionalEnv('FALLBACK_INTENT_MODEL', 'llama-3.1-8b-instant'),
   TRIAGE_MODEL:         optionalEnv('TRIAGE_MODEL',          'llama-3.1-8b-instant'),
-  RESPONSE_MODEL:       optionalEnv('RESPONSE_MODEL',        'gemini-2.5-flash'),
+  MISTRAL_API_KEY:      optionalEnv('MISTRAL_API_KEY'),
 
   // Feature flags
   INTENT_USE_SIMPLE_ROUTING: optionalEnv('INTENT_USE_SIMPLE_ROUTING', 'true'),
