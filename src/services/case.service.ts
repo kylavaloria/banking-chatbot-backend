@@ -26,6 +26,25 @@ export interface CreateCaseParams {
   recommendedPath: RecommendedPath;
 }
 
+export type CardBlockStatus = 'not_applicable' | 'offered' | 'confirmed' | 'completed';
+
+export async function updateCardBlockStatus(
+  caseId: string,
+  cardBlockStatus: CardBlockStatus
+): Promise<void> {
+  const { error } = await serviceClient
+    .from('cases')
+    .update({
+      card_block_status: cardBlockStatus,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('case_id', caseId);
+
+  if (error) {
+    throw { status: 500, message: 'Failed to update card_block_status.' };
+  }
+}
+
 export interface CaseRecord {
   case_id: string;
   customer_id: string;
