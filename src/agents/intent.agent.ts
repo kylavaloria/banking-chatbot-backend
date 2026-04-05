@@ -1,51 +1,44 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Intent Agent — Slice 1 + Slice 2 + Slice 3
-// Slice 3 additions:
-//   - detectMultiIssue: populates issue_components for 2+ operational concerns
-//   - detectHybrid: identifies mixed informational + operational messages
-//   - topic_switch: strengthened consistency check
+// Intent Agent — Slice 4: LLM-backed with deterministic fallback
+//
+// Execution order:
+//   1. Deterministic security pre-checks (malicious / out-of-scope)
+//   2. Deterministic structural pre-checks (hybrid + multi-issue)
+//   3. isSimpleMessage routing → select model
+//   4. LLM call (Groq) for single-intent messages
+//   5. JSON extraction + normalizeIntentResult()
+//   6. Fallback to rule-based classifier on any failure
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type {
-  IntentResult,
-  IntentEntities,
-  IntentFlags,
-  SupportedIntentType,
-  CaseConsistency,
-  IssueComponent,
+  IntentResult, IntentEntities, IntentFlags, SupportedIntentType,
+  CaseConsistency, IssueComponent,
 } from '../contracts/intent.contract';
-
 import type { ActiveCaseContext, RecentMessage } from '../contracts/orchestration.contract';
 
 import {
-  INFORMATIONAL_KEYWORD_RULES,
-  OPERATIONAL_KEYWORD_RULES,
-  AMBIGUOUS_SIGNAL_PHRASES,
-  AMBIGUOUS_STANDALONE_PATTERNS,
-  CLARIFICATION_CANDIDATE_INTENTS,
-  CONFIDENCE_THRESHOLDS,
-  INFORMATIONAL_INTENTS,
-  OPERATIONAL_INTENTS,
-  resolveIntentGroup,
-  KeywordRule,
-  MULTI_ISSUE_PAIRS,
-  MULTI_ISSUE_CONJUNCTION_PHRASES,
+  INFORMATIONAL_KEYWORD_RULES, OPERATIONAL_KEYWORD_RULES,
+  AMBIGUOUS_SIGNAL_PHRASES, AMBIGUOUS_STANDALONE_PATTERNS,
+  CLARIFICATION_CANDIDATE_INTENTS, CONFIDENCE_THRESHOLDS,
+  INFORMATIONAL_INTENTS, OPERATIONAL_INTENTS, resolveIntentGroup,
+  KeywordRule, MULTI_ISSUE_PAIRS, MULTI_ISSUE_CONJUNCTION_PHRASES,
   HYBRID_INFORMATIONAL_SIGNALS,
 } from '../constants/intent-taxonomy';
 
 import {
-  PROMPT_INJECTION_SUBSTRINGS,
-  PROMPT_INJECTION_PATTERNS,
-  OUT_OF_SCOPE_SUBSTRINGS,
-  DATA_EXFILTRATION_SUBSTRINGS,
+  PROMPT_INJECTION_SUBSTRINGS, PROMPT_INJECTION_PATTERNS,
+  OUT_OF_SCOPE_SUBSTRINGS, DATA_EXFILTRATION_SUBSTRINGS,
   MaliciousSignal,
 } from '../constants/malicious-patterns';
 
 import {
-  normalizeIntentResult,
-  buildFallbackIntentResult,
-  normalizeEntities,
+  normalizeIntentResult, buildFallbackIntentResult, normalizeEntities,
 } from '../utils/normalizers';
+
+import { callGroq }            from '../llm/groq.client';
+import { extractJSON }         from '../utils/json-extract';
+import { buildIntentMessages } from '../llm/prompts/intent.prompt';
+import { env }                 from '../config/env';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,42 +64,7 @@ interface ClassificationMatch {
 }
 
 // ---------------------------------------------------------------------------
-// Security detection (unchanged from Slice 2)
-// ---------------------------------------------------------------------------
-
-function detectMaliciousSignal(normalizedText: string): MaliciousSignal {
-  for (const phrase of DATA_EXFILTRATION_SUBSTRINGS) {
-    if (normalizedText.includes(phrase)) return { detected: true, signal_type: 'data_exfiltration', matched_indicator: phrase };
-  }
-  for (const phrase of PROMPT_INJECTION_SUBSTRINGS) {
-    if (normalizedText.includes(phrase)) return { detected: true, signal_type: 'prompt_injection', matched_indicator: phrase };
-  }
-  for (const pattern of PROMPT_INJECTION_PATTERNS) {
-    const match = pattern.exec(normalizedText);
-    if (match) return { detected: true, signal_type: 'prompt_injection', matched_indicator: pattern.toString() };
-  }
-  return { detected: false, signal_type: null, matched_indicator: null };
-}
-
-function detectOutOfScope(normalizedText: string): { detected: boolean; indicator: string | null } {
-  for (const phrase of OUT_OF_SCOPE_SUBSTRINGS) {
-    if (normalizedText.includes(phrase)) return { detected: true, indicator: phrase };
-  }
-  return { detected: false, indicator: null };
-}
-
-function detectAmbiguous(normalizedText: string): boolean {
-  return AMBIGUOUS_STANDALONE_PATTERNS.some(p => p.test(normalizedText));
-}
-
-function applyAmbiguityPenalty(baseConfidence: number, normalizedText: string): number {
-  const matched = AMBIGUOUS_SIGNAL_PHRASES.filter(p => normalizedText.includes(p));
-  if (matched.length === 0) return baseConfidence;
-  return Math.max(0, baseConfidence - Math.min(0.20, matched.length * 0.05));
-}
-
-// ---------------------------------------------------------------------------
-// Keyword classification (unchanged from Slice 2)
+// Contraction expansion (used by multiple functions below)
 // ---------------------------------------------------------------------------
 
 function expandContractions(text: string): string {
@@ -126,54 +84,59 @@ function expandContractions(text: string): string {
     .replace(/i'd/g,     'i did');
 }
 
+// ---------------------------------------------------------------------------
+// Keyword classification helpers
+// ---------------------------------------------------------------------------
+
 function runKeywordClassification(
   normalizedText: string,
+  expanded: string,
   rules: KeywordRule[]
 ): ClassificationMatch | null {
-  const expanded = expandContractions(normalizedText);
   let bestMatch: ClassificationMatch | null = null;
-
   for (const rule of rules) {
     const matched = rule.keywords.filter(
       kw => normalizedText.includes(kw) || expanded.includes(kw)
     );
     if (matched.length === 0) continue;
-    const bonus = Math.min(0.05, (matched.length - 1) * 0.015);
-    const confidence = Math.min(1, rule.baseConfidence + bonus);
+    const confidence = Math.min(
+      1,
+      rule.baseConfidence + Math.min(0.05, (matched.length - 1) * 0.015)
+    );
     if (!bestMatch || confidence > bestMatch.confidence) {
       bestMatch = {
         intent:     rule.intent,
         confidence,
-        evidence:   `Matched ${matched.length} keyword(s): "${matched.slice(0, 3).join('", "')}"`,
+        evidence:   `Matched: "${matched.slice(0, 3).join('", "')}"`,
       };
     }
   }
   return bestMatch;
 }
 
-/**
- * Runs all operational keyword rules against a text and returns ALL matches
- * above the given threshold, not just the best one.
- * Used for multi-issue and hybrid detection.
- */
 function runAllOperationalMatches(
   normalizedText: string,
+  expanded: string,
   minConfidence = CONFIDENCE_THRESHOLDS.CLARIFY
 ): ClassificationMatch[] {
-  const expanded = expandContractions(normalizedText);
   const results: ClassificationMatch[] = [];
   const seen = new Set<SupportedIntentType>();
-
   for (const rule of OPERATIONAL_KEYWORD_RULES) {
     if (seen.has(rule.intent)) continue;
     const matched = rule.keywords.filter(
       kw => normalizedText.includes(kw) || expanded.includes(kw)
     );
     if (matched.length === 0) continue;
-    const bonus = Math.min(0.05, (matched.length - 1) * 0.015);
-    const confidence = Math.min(1, rule.baseConfidence + bonus);
+    const confidence = Math.min(
+      1,
+      rule.baseConfidence + Math.min(0.05, (matched.length - 1) * 0.015)
+    );
     if (confidence >= minConfidence) {
-      results.push({ intent: rule.intent, confidence, evidence: `Matched: "${matched.slice(0, 2).join('", "')}"` });
+      results.push({
+        intent:     rule.intent,
+        confidence,
+        evidence:   `Matched: "${matched.slice(0, 2).join('", "')}"`,
+      });
       seen.add(rule.intent);
     }
   }
@@ -181,110 +144,79 @@ function runAllOperationalMatches(
 }
 
 // ---------------------------------------------------------------------------
-// Slice 3: Multi-issue detection
-// Conservative: requires a known co-occurrence pair AND a conjunction phrase
-// OR two independent high-confidence matches from distinct intent categories.
+// Simple message routing heuristic
+// Deterministic — no LLM involved in this decision.
 // ---------------------------------------------------------------------------
 
-interface MultiIssueDetection {
-  detected:        boolean;
-  components:      Array<{ intent: SupportedIntentType; confidence: number; evidence: string }>;
-  evidence:        string[];
-}
+export function isSimpleMessage(normalizedText: string): boolean {
+  // Conjunction phrases signal multiple issues
+  const hasConjunction = MULTI_ISSUE_CONJUNCTION_PHRASES.some(p =>
+    normalizedText.includes(p)
+  );
+  if (hasConjunction) return false;
 
-function detectMultiIssue(
-  normalizedText: string,
-  allMatches: ClassificationMatch[]
-): MultiIssueDetection {
-  if (allMatches.length < 2) {
-    return { detected: false, components: [], evidence: ['Fewer than 2 operational matches — no multi-issue'] };
+  // Hybrid signal only disqualifies when an operational keyword is also present
+  const hasHybridSignal = HYBRID_INFORMATIONAL_SIGNALS.some(s =>
+    normalizedText.includes(s)
+  );
+  if (hasHybridSignal) {
+    const expandedText = expandContractions(normalizedText);
+    const hasOpKeyword = runAllOperationalMatches(normalizedText, expandedText).length > 0;
+    if (hasOpKeyword) return false;
   }
 
-  const evidence: string[] = [];
+  // Two or more distinct operational keyword matches → likely multi-issue
+  const expandedText = expandContractions(normalizedText);
+  const allOpMatches = runAllOperationalMatches(normalizedText, expandedText);
+  if (allOpMatches.length >= 2) return false;
 
-  // Check if any known pair is present
-  const matchedIntents = new Set(allMatches.map(m => m.intent));
-  let pairFound = false;
+  // Long messages are more likely to carry complexity
+  const wordCount = normalizedText.split(/\s+/).length;
+  if (wordCount > 20) return false;
 
-  for (const [a, b] of MULTI_ISSUE_PAIRS) {
-    if (matchedIntents.has(a) && matchedIntents.has(b)) {
-      pairFound = true;
-      evidence.push(`Known multi-issue pair detected: [${a}, ${b}]`);
-      break;
+  // References to prior interactions suggest topic-switch complexity
+  if (/\b(earlier|before|previously|last time|my other|another case)\b/i.test(normalizedText)) {
+    return false;
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic security checks (run before any LLM call)
+// ---------------------------------------------------------------------------
+
+function detectMaliciousSignal(normalizedText: string): MaliciousSignal {
+  for (const phrase of DATA_EXFILTRATION_SUBSTRINGS) {
+    if (normalizedText.includes(phrase)) {
+      return { detected: true, signal_type: 'data_exfiltration', matched_indicator: phrase };
     }
   }
-
-  // Check for conjunction phrase
-  const conjunctionFound = MULTI_ISSUE_CONJUNCTION_PHRASES.some(p => normalizedText.includes(p));
-  if (conjunctionFound) evidence.push('Conjunction phrase detected (signals multiple issues)');
-
-  // Split decision: require pair OR (two high-confidence matches + conjunction)
-  const highConfidenceMatches = allMatches.filter(m => m.confidence >= CONFIDENCE_THRESHOLDS.ACCEPT);
-  const splitByConjunction = conjunctionFound && highConfidenceMatches.length >= 2;
-
-  if (!pairFound && !splitByConjunction) {
-    evidence.push('No known pair and no conjunction with 2 high-confidence matches — not splitting');
-    return { detected: false, components: [], evidence };
+  for (const phrase of PROMPT_INJECTION_SUBSTRINGS) {
+    if (normalizedText.includes(phrase)) {
+      return { detected: true, signal_type: 'prompt_injection', matched_indicator: phrase };
+    }
   }
+  for (const pattern of PROMPT_INJECTION_PATTERNS) {
+    const m = pattern.exec(normalizedText);
+    if (m) {
+      return { detected: true, signal_type: 'prompt_injection', matched_indicator: pattern.toString() };
+    }
+  }
+  return { detected: false, signal_type: null, matched_indicator: null };
+}
 
-  // Collect the two strongest distinct matches
-  const top2 = allMatches
-    .sort((a, b) => b.confidence - a.confidence)
-    .slice(0, 2);
-
-  evidence.push(`Splitting into ${top2.length} components: ${top2.map(m => m.intent).join(', ')}`);
-  return {
-    detected:   true,
-    components: top2,
-    evidence,
-  };
+function detectOutOfScope(
+  normalizedText: string
+): { detected: boolean; indicator: string | null } {
+  for (const phrase of OUT_OF_SCOPE_SUBSTRINGS) {
+    if (normalizedText.includes(phrase)) return { detected: true, indicator: phrase };
+  }
+  return { detected: false, indicator: null };
 }
 
 // ---------------------------------------------------------------------------
-// Slice 3: Hybrid detection
-// Requires one informational signal AND one operational match above threshold.
-// ---------------------------------------------------------------------------
-
-interface HybridDetection {
-  detected:              boolean;
-  informationalSignal:   string | null;
-  operationalMatch:      ClassificationMatch | null;
-  evidence:              string[];
-}
-
-function detectHybrid(
-  normalizedText: string,
-  bestOperationalMatch: ClassificationMatch | null
-): HybridDetection {
-  const evidence: string[] = [];
-
-  if (!bestOperationalMatch || bestOperationalMatch.confidence < CONFIDENCE_THRESHOLDS.ACCEPT) {
-    return { detected: false, informationalSignal: null, operationalMatch: null, evidence: ['No high-confidence operational match for hybrid check'] };
-  }
-
-  const infoSignal = HYBRID_INFORMATIONAL_SIGNALS.find(s => normalizedText.includes(s));
-  if (!infoSignal) {
-    return { detected: false, informationalSignal: null, operationalMatch: null, evidence: ['No informational signal found'] };
-  }
-
-  // Verify the informational signal also matches a known informational keyword rule
-  const infoMatch = runKeywordClassification(normalizedText, INFORMATIONAL_KEYWORD_RULES);
-  if (!infoMatch || infoMatch.confidence < CONFIDENCE_THRESHOLDS.CLARIFY) {
-    evidence.push(`Informational signal "${infoSignal}" found but no strong informational rule match`);
-    return { detected: false, informationalSignal: null, operationalMatch: null, evidence };
-  }
-
-  evidence.push(`Hybrid detected: informational="${infoMatch.intent}" + operational="${bestOperationalMatch.intent}"`);
-  return {
-    detected:            true,
-    informationalSignal: infoSignal,
-    operationalMatch:    bestOperationalMatch,
-    evidence,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Entity extraction (unchanged from Slice 2)
+// Entity extraction
 // ---------------------------------------------------------------------------
 
 function extractEntities(rawMessage: string): IntentEntities {
@@ -294,18 +226,22 @@ function extractEntities(rawMessage: string): IntentEntities {
   };
   const lower = rawMessage.toLowerCase();
 
-  const amountMatch = rawMessage.match(/(?:php|usd|p|₱)?\s*([\d,]+(?:\.\d{1,2})?)\s*(?:php|usd|pesos?|dollars?)?/i);
+  const amountMatch = rawMessage.match(
+    /(?:php|usd|p|₱)?\s*([\d,]+(?:\.\d{1,2})?)\s*(?:php|usd|pesos?|dollars?)?/i
+  );
   if (amountMatch) {
-    const parsed = parseFloat(amountMatch[1].replace(/,/g, ''));
-    if (isFinite(parsed) && parsed > 0) entities.amount = parsed;
+    const p = parseFloat(amountMatch[1].replace(/,/g, ''));
+    if (isFinite(p) && p > 0) entities.amount = p;
   }
 
   const refMatch = rawMessage.match(/\b([A-Z0-9]{6,20})\b/);
   if (refMatch) entities.reference_number = refMatch[1];
 
   const datePatterns = [
-    /yesterday/i, /last (monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i,
-    /last week/i, /\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?/,
+    /yesterday/i,
+    /last (monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i,
+    /last week/i,
+    /\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?/,
     /january|february|march|april|may|june|july|august|september|october|november|december/i,
     /today|this morning|this afternoon|this evening|earlier today/i,
   ];
@@ -314,39 +250,30 @@ function extractEntities(rawMessage: string): IntentEntities {
     if (m) { entities.date_reference = m[0]; break; }
   }
 
-  if (lower.includes('mobile app') || lower.includes('app'))         entities.channel = 'mobile_app';
-  else if (lower.includes('atm'))                                     entities.channel = 'atm';
-  else if (lower.includes('online banking'))                          entities.channel = 'online_banking';
-  else if (lower.includes('branch') || lower.includes('teller'))     entities.channel = 'branch';
-  else if (lower.includes('pos') || lower.includes('point of sale'))  entities.channel = 'pos';
+  if (lower.includes('mobile app') || lower.includes('app')) entities.channel = 'mobile_app';
+  else if (lower.includes('atm'))                             entities.channel = 'atm';
+  else if (lower.includes('online banking'))                  entities.channel = 'online_banking';
+  else if (lower.includes('branch') || lower.includes('teller')) entities.channel = 'branch';
 
   if (lower.includes('credit card'))          entities.product = 'credit_card';
   else if (lower.includes('debit card'))      entities.product = 'debit_card';
   else if (lower.includes('savings account')) entities.product = 'savings_account';
-  else if (lower.includes('checking account') || lower.includes('current account'))
-                                              entities.product = 'checking_account';
   else if (lower.includes('loan'))            entities.product = 'loan';
-  else if (lower.includes('time deposit') || lower.includes('td')) entities.product = 'time_deposit';
 
-  const urgencyCues = ['urgent', 'emergency', 'immediately', 'asap', 'right now',
-                       'critical', 'important', 'as soon as possible'];
-  const cue = urgencyCues.find(c => lower.includes(c));
+  const cue = ['urgent', 'emergency', 'immediately', 'asap', 'right now']
+    .find(c => lower.includes(c));
   if (cue) entities.urgency_cue = cue;
 
-  const actionPatterns: Array<[RegExp, string]> = [
-    [/i (did not|didn't) (make|authorize|do)/i, 'denied_action'],
-    [/someone (used|took|withdrew|transferred)/i, 'third_party_action'],
-    [/i (transferred|sent|paid|withdrew)/i, 'customer_initiated_action'],
-  ];
-  for (const [pattern, label] of actionPatterns) {
-    if (pattern.test(rawMessage)) { entities.reported_action = label; break; }
-  }
+  if (/i (did not|didn't) (make|authorize|do)/i.test(rawMessage))
+    entities.reported_action = 'denied_action';
+  else if (/someone (used|took|withdrew|transferred)/i.test(rawMessage))
+    entities.reported_action = 'third_party_action';
 
   return normalizeEntities(entities);
 }
 
 // ---------------------------------------------------------------------------
-// Case consistency (Slice 3: strengthened)
+// Consistency check
 // ---------------------------------------------------------------------------
 
 function resolveConsistency(
@@ -357,90 +284,242 @@ function resolveConsistency(
   if (activeCase.primary_intent_type === intentType) return 'same_case';
   if (intentType === 'complaint_follow_up') return 'same_case';
   if (intentType === 'general_complaint')   return 'possible_topic_switch';
-
-  // Slice 3: if the new intent is clearly operational and different, mark as new_issue
-  if (OPERATIONAL_INTENTS.has(intentType)) return 'new_issue';
+  if (OPERATIONAL_INTENTS.has(intentType))  return 'new_issue';
   return 'possible_topic_switch';
-}
-
-// ---------------------------------------------------------------------------
-// Flag computation
-// ---------------------------------------------------------------------------
-
-function buildFlags(options: {
-  malicious:   boolean;
-  ambiguous:   boolean;
-  confidence:  number;
-  consistency: CaseConsistency;
-  multiIssue:  boolean;
-  hybrid:      boolean;
-}): IntentFlags {
-  return {
-    ambiguous:      options.ambiguous || options.confidence < CONFIDENCE_THRESHOLDS.CLARIFY,
-    multi_issue:    options.multiIssue,
-    hybrid:         options.hybrid,
-    topic_switch:   options.consistency === 'new_issue' || options.consistency === 'possible_topic_switch',
-    malicious_input:options.malicious,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Clarification bias (unchanged from Slice 2)
-// ---------------------------------------------------------------------------
-
-function applyClarificationBias(
-  bestMatch: ClassificationMatch | null,
-  clarificationCtx: ClarificationContext,
-  normalizedText: string,
-  evidence: string[]
-): ClassificationMatch | null {
-  if (!bestMatch) {
-    const candidateRules = [
-      ...OPERATIONAL_KEYWORD_RULES,
-      ...INFORMATIONAL_KEYWORD_RULES,
-    ].filter(rule => clarificationCtx.candidateIntents.includes(rule.intent));
-    const biasedMatch = runKeywordClassification(normalizedText, candidateRules);
-    if (biasedMatch) {
-      const boosted = Math.min(1, biasedMatch.confidence + 0.05);
-      evidence.push(`Clarification bias: matched candidate "${biasedMatch.intent}" → ${boosted.toFixed(2)}`);
-      return { ...biasedMatch, confidence: boosted };
-    }
-    evidence.push('Clarification bias: no candidate matched in follow-up');
-    return null;
-  }
-  if (clarificationCtx.candidateIntents.includes(bestMatch.intent)) {
-    const boosted = Math.min(1, bestMatch.confidence + 0.05);
-    evidence.push(`Clarification bias: boosted existing match "${bestMatch.intent}" → ${boosted.toFixed(2)}`);
-    return { ...bestMatch, confidence: boosted };
-  }
-  return bestMatch;
 }
 
 // ---------------------------------------------------------------------------
 // Issue summary builder
 // ---------------------------------------------------------------------------
 
-function buildIssueSummary(intentType: SupportedIntentType, entities: IntentEntities): string {
+function buildIssueSummary(
+  intentType: SupportedIntentType,
+  entities: IntentEntities
+): string {
   const product = entities.product ? ` related to ${entities.product.replace(/_/g, ' ')}` : '';
   const amount  = entities.amount  != null ? ` for ${entities.amount}` : '';
   const map: Partial<Record<SupportedIntentType, string>> = {
-    unauthorized_transaction:          `Unauthorized or unrecognized transaction reported${amount}${product}.`,
+    unauthorized_transaction:          `Unauthorized transaction reported${amount}${product}.`,
     lost_or_stolen_card:               `Lost or stolen card reported${product}.`,
     failed_or_delayed_transfer:        `Failed or delayed transfer reported${amount}.`,
     refund_or_reversal_issue:          `Refund or reversal issue reported${amount}.`,
     account_access_issue:              `Customer cannot access their account${product}.`,
-    account_restriction_issue:         `Account restriction or block reported${product}.`,
+    account_restriction_issue:         `Account restriction reported${product}.`,
     billing_or_fee_dispute:            `Billing error or fee dispute reported${amount}.`,
     complaint_follow_up:               `Customer following up on an existing complaint.`,
     service_quality_complaint:         `Customer complaint about service quality.`,
-    document_or_certification_request:`Request for bank document or certificate${product}.`,
+    document_or_certification_request:`Request for bank document${product}.`,
     product_info:                      `Customer asking about product information${product}.`,
     requirements_inquiry:              `Customer asking about requirements${product}.`,
     policy_or_process_inquiry:         `Customer asking about a policy or process.`,
-    fee_or_rate_inquiry:               `Customer asking about fees or interest rates${product}.`,
+    fee_or_rate_inquiry:               `Customer asking about fees or rates${product}.`,
     branch_or_service_info:            `Customer asking about branch or service information.`,
   };
   return map[intentType] ?? `Customer inquiry: ${intentType.replace(/_/g, ' ')}.`;
+}
+
+// ---------------------------------------------------------------------------
+// Rule-based fallback classifier (Slice 3 — used when LLM fails)
+// ---------------------------------------------------------------------------
+
+async function classifyIntentRuleBased(input: IntentAgentInput): Promise<IntentResult> {
+  const { userMessage, activeCase, clarificationContext } = input;
+  const normalizedText = userMessage.toLowerCase().trim();
+  const expanded       = expandContractions(normalizedText);
+  const evidence: string[] = ['[FALLBACK: rule-based classifier]'];
+
+  const isStandaloneAmbiguous = AMBIGUOUS_STANDALONE_PATTERNS.some(p =>
+    p.test(normalizedText)
+  );
+  if (isStandaloneAmbiguous) evidence.push('Standalone ambiguous pattern');
+
+  const allOpMatches  = runAllOperationalMatches(normalizedText, expanded);
+  const bestOpMatch   = allOpMatches[0] ?? null;
+  const bestInfoMatch = runKeywordClassification(normalizedText, expanded, INFORMATIONAL_KEYWORD_RULES);
+
+  // Multi-issue fallback
+  if (allOpMatches.length >= 2) {
+    const hasConjunction = MULTI_ISSUE_CONJUNCTION_PHRASES.some(p => normalizedText.includes(p));
+    const matchedIntents = new Set(allOpMatches.map(m => m.intent));
+    const hasPair        = MULTI_ISSUE_PAIRS.some(([a, b]) =>
+      matchedIntents.has(a) && matchedIntents.has(b)
+    );
+    const highConf = allOpMatches.filter(m => m.confidence >= CONFIDENCE_THRESHOLDS.ACCEPT);
+    if (hasPair || (hasConjunction && highConf.length >= 2)) {
+      const top2     = [...allOpMatches].sort((a, b) => b.confidence - a.confidence).slice(0, 2);
+      const entities = extractEntities(userMessage);
+      const components: IssueComponent[] = top2.map(c => ({
+        intent_type:  c.intent,
+        intent_group: 'operational' as const,
+        confidence:   c.confidence,
+        entities,
+        summary:      buildIssueSummary(c.intent, entities),
+      }));
+      return normalizeIntentResult({
+        intent_type: 'multi_issue_case', intent_group: 'operational',
+        confidence:  Math.min(...top2.map(c => c.confidence)),
+        secondary_intents: [top2[1].intent], entities,
+        flags: {
+          ambiguous: false, multi_issue: true, hybrid: false,
+          topic_switch: false, malicious_input: false,
+        },
+        issue_components:                    components,
+        candidate_intents_for_clarification: [],
+        consistency_with_active_case:        resolveConsistency(top2[0].intent, activeCase),
+        evidence,
+      });
+    }
+  }
+
+  // Hybrid fallback
+  if (bestOpMatch && bestInfoMatch &&
+      bestOpMatch.confidence >= CONFIDENCE_THRESHOLDS.ACCEPT) {
+    const hasHybridSignal = HYBRID_INFORMATIONAL_SIGNALS.some(s =>
+      normalizedText.includes(s)
+    );
+    if (hasHybridSignal) {
+      const entities = extractEntities(userMessage);
+      return normalizeIntentResult({
+        intent_type:  bestOpMatch.intent,
+        intent_group: 'operational',
+        confidence:   bestOpMatch.confidence,
+        secondary_intents: [bestInfoMatch.intent],
+        entities,
+        flags: {
+          ambiguous: false, multi_issue: false, hybrid: true,
+          topic_switch: false, malicious_input: false,
+        },
+        issue_components: [
+          {
+            intent_type:  bestInfoMatch.intent,
+            intent_group: 'informational' as const,
+            confidence:   bestInfoMatch.confidence,
+            entities,
+            summary:      buildIssueSummary(bestInfoMatch.intent, entities),
+          },
+          {
+            intent_type:  bestOpMatch.intent,
+            intent_group: 'operational' as const,
+            confidence:   bestOpMatch.confidence,
+            entities,
+            summary:      buildIssueSummary(bestOpMatch.intent, entities),
+          },
+        ],
+        candidate_intents_for_clarification: [],
+        consistency_with_active_case: resolveConsistency(bestOpMatch.intent, activeCase),
+        evidence,
+      });
+    }
+  }
+
+  // Standard single-intent fallback
+  let bestMatch: ClassificationMatch | null =
+    bestOpMatch && bestInfoMatch
+      ? (bestOpMatch.confidence >= bestInfoMatch.confidence ? bestOpMatch : bestInfoMatch)
+      : (bestOpMatch ?? bestInfoMatch);
+
+  if (clarificationContext && bestMatch) {
+    if (clarificationContext.candidateIntents.includes(bestMatch.intent)) {
+      bestMatch = { ...bestMatch, confidence: Math.min(1, bestMatch.confidence + 0.05) };
+    }
+  }
+
+  const finalConf = bestMatch
+    ? Math.max(
+        0,
+        bestMatch.confidence -
+          Math.min(
+            0.20,
+            AMBIGUOUS_SIGNAL_PHRASES.filter(p => normalizedText.includes(p)).length * 0.05
+          )
+      )
+    : 0;
+
+  const intentType: SupportedIntentType =
+    !bestMatch || finalConf < CONFIDENCE_THRESHOLDS.AMBIGUOUS || isStandaloneAmbiguous
+      ? 'unclear_issue'
+      : bestMatch.intent;
+
+  const entities    = extractEntities(userMessage);
+  const group       = resolveIntentGroup(intentType);
+  const consistency = resolveConsistency(intentType, activeCase);
+  const isAmbiguous = isStandaloneAmbiguous || finalConf < CONFIDENCE_THRESHOLDS.CLARIFY;
+
+  return normalizeIntentResult({
+    intent_type:  intentType,
+    intent_group: group,
+    confidence:   finalConf,
+    secondary_intents: [],
+    entities,
+    flags: {
+      ambiguous:      isAmbiguous,
+      multi_issue:    false,
+      hybrid:         false,
+      topic_switch:   consistency === 'new_issue' || consistency === 'possible_topic_switch',
+      malicious_input:false,
+    },
+    issue_components: intentType !== 'unclear_issue' && intentType !== 'unsupported_request'
+      ? [{
+          intent_type:  intentType,
+          intent_group: group,
+          confidence:   finalConf,
+          entities,
+          summary:      buildIssueSummary(intentType, entities),
+        }]
+      : [],
+    candidate_intents_for_clarification: isAmbiguous
+      ? (clarificationContext?.candidateIntents ?? CLARIFICATION_CANDIDATE_INTENTS)
+      : [],
+    consistency_with_active_case: consistency,
+    evidence,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// LLM-backed classification
+// ---------------------------------------------------------------------------
+
+async function classifyIntentLLM(
+  input: IntentAgentInput,
+  model: string
+): Promise<IntentResult | null> {
+  try {
+    const messages = buildIntentMessages(
+      input.userMessage,
+      input.recentMessages,
+      input.activeCase,
+      input.clarificationContext ?? null
+    );
+
+    const llmResponse = await callGroq({
+      messages,
+      model,
+      temperature: 0.1,
+      maxTokens:   1024,
+    });
+
+    const parsed = extractJSON(llmResponse.text);
+    if (!parsed) {
+      console.warn('[IntentAgent] LLM returned unparseable JSON', {
+        model,
+        text: llmResponse.text.slice(0, 200),
+      });
+      return null;
+    }
+
+    parsed['raw_llm_output'] = {
+      model_used: llmResponse.model_used,
+      usage:      llmResponse.usage,
+    };
+
+    return normalizeIntentResult(parsed);
+  } catch (err) {
+    console.warn(
+      '[IntentAgent] LLM call failed, will use fallback',
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,177 +527,170 @@ function buildIssueSummary(intentType: SupportedIntentType, entities: IntentEnti
 // ---------------------------------------------------------------------------
 
 export async function classifyIntent(input: IntentAgentInput): Promise<IntentResult> {
-  const { userMessage, recentMessages, activeCase, clarificationContext } = input;
+  const { userMessage, activeCase } = input;
 
   if (!userMessage || userMessage.trim().length === 0) {
     return buildFallbackIntentResult('Empty user message');
   }
 
   const normalizedText = userMessage.toLowerCase().trim();
-  const evidence: string[] = [];
 
-  // ── Step 1: Malicious ────────────────────────────────────────────────────
+  // ── Step 1: Malicious pre-check ───────────────────────────────────────────
   const maliciousSignal = detectMaliciousSignal(normalizedText);
   if (maliciousSignal.detected) {
-    evidence.push(`Malicious: ${maliciousSignal.signal_type} — "${maliciousSignal.matched_indicator}"`);
     return normalizeIntentResult({
-      intent_type: 'unsupported_request', intent_group: 'out_of_scope', confidence: 1.0,
-      secondary_intents: [], entities: extractEntities(userMessage),
-      flags: { ambiguous: false, multi_issue: false, hybrid: false, topic_switch: false, malicious_input: true },
-      issue_components: [], candidate_intents_for_clarification: [],
-      consistency_with_active_case: activeCase ? 'same_case' : 'no_active_case', evidence,
+      intent_type:  'unsupported_request',
+      intent_group: 'out_of_scope',
+      confidence:   1.0,
+      secondary_intents: [],
+      entities: extractEntities(userMessage),
+      flags: {
+        ambiguous: false, multi_issue: false, hybrid: false,
+        topic_switch: false, malicious_input: true,
+      },
+      issue_components:                    [],
+      candidate_intents_for_clarification: [],
+      consistency_with_active_case: activeCase ? 'same_case' : 'no_active_case',
+      evidence: [
+        `Malicious pre-check: ${maliciousSignal.signal_type} — "${maliciousSignal.matched_indicator}"`,
+      ],
     });
   }
 
-  // ── Step 2: Out-of-scope ─────────────────────────────────────────────────
+  // ── Step 2: Out-of-scope pre-check ────────────────────────────────────────
   const outOfScope = detectOutOfScope(normalizedText);
   if (outOfScope.detected) {
-    evidence.push(`Out-of-scope: "${outOfScope.indicator}"`);
     return normalizeIntentResult({
-      intent_type: 'unsupported_request', intent_group: 'out_of_scope', confidence: 0.95,
-      secondary_intents: [], entities: extractEntities(userMessage),
-      flags: { ambiguous: false, multi_issue: false, hybrid: false, topic_switch: false, malicious_input: false },
-      issue_components: [], candidate_intents_for_clarification: [],
-      consistency_with_active_case: activeCase ? 'same_case' : 'no_active_case', evidence,
-    });
-  }
-
-  // ── Step 3: Standalone ambiguity ─────────────────────────────────────────
-  const isStandaloneAmbiguous = detectAmbiguous(normalizedText);
-  if (isStandaloneAmbiguous) evidence.push('Standalone ambiguous pattern matched');
-
-  // ── Step 4: All operational matches (for multi-issue + hybrid) ───────────
-  const allOperationalMatches = runAllOperationalMatches(normalizedText);
-  const bestOperationalMatch  = allOperationalMatches[0] ?? null;
-  const bestInformationalMatch = runKeywordClassification(normalizedText, INFORMATIONAL_KEYWORD_RULES);
-
-  // ── Step 5: Hybrid detection ─────────────────────────────────────────────
-  const hybridDetection = detectHybrid(normalizedText, bestOperationalMatch);
-  if (hybridDetection.detected && bestOperationalMatch && bestInformationalMatch) {
-    evidence.push(...hybridDetection.evidence);
-    const entities = extractEntities(userMessage);
-    const components: IssueComponent[] = [
-      {
-        intent_type:  bestInformationalMatch.intent,
-        intent_group: 'informational' as const,
-        confidence:   bestInformationalMatch.confidence,
-        entities,
-        summary:      buildIssueSummary(bestInformationalMatch.intent, entities),
-      },
-      {
-        intent_type:  bestOperationalMatch.intent,
-        intent_group: 'operational' as const,
-        confidence:   bestOperationalMatch.confidence,
-        entities,
-        summary:      buildIssueSummary(bestOperationalMatch.intent, entities),
-      },
-    ];
-    const consistency = resolveConsistency(bestOperationalMatch.intent, activeCase);
-    return normalizeIntentResult({
-      intent_type:  bestOperationalMatch.intent,
-      intent_group: 'operational',
-      confidence:   bestOperationalMatch.confidence,
-      secondary_intents: [bestInformationalMatch.intent],
-      entities,
+      intent_type:  'unsupported_request',
+      intent_group: 'out_of_scope',
+      confidence:   0.95,
+      secondary_intents: [],
+      entities: extractEntities(userMessage),
       flags: {
-        ambiguous: false, multi_issue: false, hybrid: true,
-        topic_switch: consistency === 'new_issue', malicious_input: false,
+        ambiguous: false, multi_issue: false, hybrid: false,
+        topic_switch: false, malicious_input: false,
       },
-      issue_components:                    components,
+      issue_components:                    [],
       candidate_intents_for_clarification: [],
-      consistency_with_active_case:        consistency,
-      evidence,
+      consistency_with_active_case: activeCase ? 'same_case' : 'no_active_case',
+      evidence: [`Out-of-scope pre-check: "${outOfScope.indicator}"`],
     });
   }
 
-  // ── Step 6: Multi-issue detection ────────────────────────────────────────
-  const multiIssueDetection = detectMultiIssue(normalizedText, allOperationalMatches);
-  if (multiIssueDetection.detected) {
-    evidence.push(...multiIssueDetection.evidence);
-    const entities = extractEntities(userMessage);
-    const components: IssueComponent[] = multiIssueDetection.components.map(c => ({
-      intent_type:  c.intent,
-      intent_group: 'operational' as const,
-      confidence:   c.confidence,
-      entities,
-      summary:      buildIssueSummary(c.intent, entities),
-    }));
-    const primaryIntent = multiIssueDetection.components[0].intent;
-    const consistency   = resolveConsistency(primaryIntent, activeCase);
-    return normalizeIntentResult({
-      intent_type:  'multi_issue_case',
-      intent_group: 'operational',
-      confidence:   Math.min(...multiIssueDetection.components.map(c => c.confidence)),
-      secondary_intents: multiIssueDetection.components.slice(1).map(c => c.intent),
-      entities,
-      flags: {
-        ambiguous: false, multi_issue: true, hybrid: false,
-        topic_switch: consistency === 'new_issue', malicious_input: false,
-      },
-      issue_components:                    components,
-      candidate_intents_for_clarification: [],
-      consistency_with_active_case:        consistency,
-      evidence,
-    });
+  // ── Step 3: Structural pre-checks (hybrid + multi-issue) ─────────────────
+  // These remain deterministic regardless of LLM. Multi-issue and hybrid
+  // decomposition must be consistent across runs — LLM is not used here.
+  const expandedText  = expandContractions(normalizedText);
+  const allOpMatches  = runAllOperationalMatches(normalizedText, expandedText);
+  const bestOpMatch   = allOpMatches[0] ?? null;
+  const bestInfoMatch = runKeywordClassification(
+    normalizedText, expandedText, INFORMATIONAL_KEYWORD_RULES
+  );
+
+  // Hybrid pre-check: clear informational signal + strong operational match
+  if (bestOpMatch && bestInfoMatch &&
+      bestOpMatch.confidence >= CONFIDENCE_THRESHOLDS.ACCEPT) {
+    const hasHybridSignal = HYBRID_INFORMATIONAL_SIGNALS.some(s =>
+      normalizedText.includes(s)
+    );
+    if (hasHybridSignal) {
+      const entities    = extractEntities(userMessage);
+      const consistency = resolveConsistency(bestOpMatch.intent, activeCase);
+      return normalizeIntentResult({
+        intent_type:  bestOpMatch.intent,
+        intent_group: 'operational',
+        confidence:   bestOpMatch.confidence,
+        secondary_intents: [bestInfoMatch.intent],
+        entities,
+        flags: {
+          ambiguous: false, multi_issue: false, hybrid: true,
+          topic_switch: consistency === 'new_issue', malicious_input: false,
+        },
+        issue_components: [
+          {
+            intent_type:  bestInfoMatch.intent,
+            intent_group: 'informational' as const,
+            confidence:   bestInfoMatch.confidence,
+            entities,
+            summary:      buildIssueSummary(bestInfoMatch.intent, entities),
+          },
+          {
+            intent_type:  bestOpMatch.intent,
+            intent_group: 'operational' as const,
+            confidence:   bestOpMatch.confidence,
+            entities,
+            summary:      buildIssueSummary(bestOpMatch.intent, entities),
+          },
+        ],
+        candidate_intents_for_clarification: [],
+        consistency_with_active_case:        consistency,
+        evidence: [
+          `Pre-check hybrid: info=${bestInfoMatch.intent} op=${bestOpMatch.intent}`,
+        ],
+      });
+    }
   }
 
-  // ── Step 7: Standard single-intent path (Slice 1 / Slice 2) ─────────────
-  let bestMatch: ClassificationMatch | null = null;
-  if (bestOperationalMatch && bestInformationalMatch) {
-    bestMatch = bestOperationalMatch.confidence >= bestInformationalMatch.confidence
-      ? bestOperationalMatch : bestInformationalMatch;
-    evidence.push(`Both matches; selected ${bestMatch.intent} (${bestMatch.confidence.toFixed(2)})`);
-  } else if (bestOperationalMatch) {
-    bestMatch = bestOperationalMatch;
-    evidence.push(`Operational: ${bestOperationalMatch.intent} (${bestOperationalMatch.confidence.toFixed(2)})`);
-    evidence.push(bestOperationalMatch.evidence);
-  } else if (bestInformationalMatch) {
-    bestMatch = bestInformationalMatch;
-    evidence.push(`Informational: ${bestInformationalMatch.intent} (${bestInformationalMatch.confidence.toFixed(2)})`);
-    evidence.push(bestInformationalMatch.evidence);
+  // Multi-issue pre-check: 2+ distinct operational intents with pair or conjunction
+  if (allOpMatches.length >= 2) {
+    const hasConjunction = MULTI_ISSUE_CONJUNCTION_PHRASES.some(p =>
+      normalizedText.includes(p)
+    );
+    const matchedIntents = new Set(allOpMatches.map(m => m.intent));
+    const hasPair        = MULTI_ISSUE_PAIRS.some(([a, b]) =>
+      matchedIntents.has(a) && matchedIntents.has(b)
+    );
+    const highConf = allOpMatches.filter(
+      m => m.confidence >= CONFIDENCE_THRESHOLDS.ACCEPT
+    );
+    if (hasPair || (hasConjunction && highConf.length >= 2)) {
+      const top2     = [...allOpMatches]
+        .sort((a, b) => b.confidence - a.confidence)
+        .slice(0, 2);
+      const entities    = extractEntities(userMessage);
+      const consistency = resolveConsistency(top2[0].intent, activeCase);
+      return normalizeIntentResult({
+        intent_type:  'multi_issue_case',
+        intent_group: 'operational',
+        confidence:   Math.min(...top2.map(c => c.confidence)),
+        secondary_intents: [top2[1].intent],
+        entities,
+        flags: {
+          ambiguous: false, multi_issue: true, hybrid: false,
+          topic_switch: consistency === 'new_issue', malicious_input: false,
+        },
+        issue_components: top2.map(c => ({
+          intent_type:  c.intent,
+          intent_group: 'operational' as const,
+          confidence:   c.confidence,
+          entities,
+          summary:      buildIssueSummary(c.intent, entities),
+        })),
+        candidate_intents_for_clarification: [],
+        consistency_with_active_case:        consistency,
+        evidence: [
+          `Pre-check multi-issue: ${top2.map(c => c.intent).join(' + ')}`,
+        ],
+      });
+    }
   }
 
-  if (clarificationContext) {
-    evidence.push(`Clarification loop (turn ${clarificationContext.turnCount})`);
-    bestMatch = applyClarificationBias(bestMatch, clarificationContext, normalizedText, evidence);
+  // ── Step 4: LLM routing + call (single-intent messages only) ─────────────
+  const useSimpleRouting = env.INTENT_USE_SIMPLE_ROUTING !== 'false';
+  const simple = isSimpleMessage(normalizedText);
+  const model  = useSimpleRouting && simple
+    ? env.FALLBACK_INTENT_MODEL   // llama-3.1-8b-instant
+    : env.PRIMARY_INTENT_MODEL;   // llama-3.3-70b-versatile
+
+  if (env.NODE_ENV !== 'test') {
+    const llmResult = await classifyIntentLLM(input, model);
+    if (llmResult) {
+      (llmResult as any)._routing = { simple, model_used: model };
+      return llmResult;
+    }
+    console.warn('[IntentAgent] Falling back to rule-based classifier');
   }
 
-  let finalConfidence = bestMatch
-    ? applyAmbiguityPenalty(bestMatch.confidence, normalizedText) : 0;
-
-  let intentType: SupportedIntentType;
-  if (!bestMatch || finalConfidence < CONFIDENCE_THRESHOLDS.AMBIGUOUS || isStandaloneAmbiguous) {
-    intentType      = 'unclear_issue';
-    finalConfidence = isStandaloneAmbiguous ? 0.40 : (bestMatch ? finalConfidence : 0);
-    evidence.push(bestMatch
-      ? `Below threshold → unclear_issue`
-      : 'No match → unclear_issue');
-  } else {
-    intentType = bestMatch.intent;
-  }
-
-  const entities      = extractEntities(userMessage);
-  const resolvedGroup = resolveIntentGroup(intentType);
-  const consistency   = resolveConsistency(intentType, activeCase);
-  const isAmbiguous   = isStandaloneAmbiguous || finalConfidence < CONFIDENCE_THRESHOLDS.CLARIFY;
-
-  const flags = buildFlags({
-    malicious: false, ambiguous: isAmbiguous, confidence: finalConfidence,
-    consistency, multiIssue: false, hybrid: false,
-  });
-
-  const candidateIntents: SupportedIntentType[] = isAmbiguous
-    ? (clarificationContext?.candidateIntents ?? CLARIFICATION_CANDIDATE_INTENTS) : [];
-
-  const issueComponents: IssueComponent[] =
-    intentType !== 'unclear_issue' && intentType !== 'unsupported_request'
-      ? [{ intent_type: intentType, intent_group: resolvedGroup, confidence: finalConfidence, entities, summary: buildIssueSummary(intentType, entities) }]
-      : [];
-
-  return normalizeIntentResult({
-    intent_type: intentType, intent_group: resolvedGroup, confidence: finalConfidence,
-    secondary_intents: [], entities, flags, issue_components: issueComponents,
-    candidate_intents_for_clarification: candidateIntents,
-    consistency_with_active_case: consistency, evidence,
-  });
+  // ── Step 5: Rule-based fallback ───────────────────────────────────────────
+  return classifyIntentRuleBased(input);
 }
