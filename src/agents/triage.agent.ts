@@ -211,7 +211,10 @@ export async function triageIntentAsync(
   const evidence: string[] = [`Triaging: ${intentType}`];
 
   let signals: TriageSignals | null = null;
-  if (env.NODE_ENV !== 'test') {
+  if (intentType === 'failed_or_delayed_transfer') {
+    evidence.push('[triage] Rule-based signals only for failed_or_delayed_transfer');
+    signals = extractSignalsRuleBased(intentResult, evidence);
+  } else if (env.NODE_ENV !== 'test') {
     signals = await extractSignalsLLM(userMessage, intentResult, evidence);
   }
 
