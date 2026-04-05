@@ -348,3 +348,23 @@ export const CLARIFICATION_CANDIDATE_INTENTS: SupportedIntentType[] = [
   'fee_or_rate_inquiry',
   'policy_or_process_inquiry',
 ];
+
+/**
+ * Phrases that indicate the user is confirming a card block offer.
+ * Checked only when case stage = awaiting_card_block_confirmation.
+ */
+export const CARD_BLOCK_CONFIRM_PHRASES: string[] = [
+  'yes', 'yes please', 'confirm', 'please block', 'block it', 'go ahead',
+  'proceed', 'do it', 'sure', 'ok', 'okay', 'block my card', 'yes block',
+  'please proceed', 'i confirm', 'block the card', 'yes do it',
+];
+
+/**
+ * Phrases that indicate the user is declining a card block offer.
+ * Checked only when case stage = awaiting_card_block_confirmation.
+ */
+export const CARD_BLOCK_DECLINE_PHRASES: string[] = [
+  'no', 'no thanks', 'no thank you', 'don\'t block', 'do not block',
+  'skip', 'cancel', 'nevermind', 'never mind', 'not now', 'decline',
+  'i will keep it', 'keep it active', 'no need', 'not necessary',
+];

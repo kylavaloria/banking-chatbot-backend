@@ -77,14 +77,22 @@ export const PROMPT_INJECTION_SUBSTRINGS: string[] = [
 export const OUT_OF_SCOPE_SUBSTRINGS: string[] = [
   // Code generation
   'write me a script',
+  'write me a python',       // ← add
+  'write me a program',      // ← add
+  'write me a function',     // ← add
+  'write me code',           // ← add
   'write a python',
   'write code',
   'generate code',
+  'generate a script',       // ← add
   'write a program',
   'debug my code',
   'fix my code',
   'write a function',
   'code for',
+  'python script',           // ← add (catches "a python script" regardless of verb)
+  'javascript function',     // ← add
+  'sql query',               // ← add
 
   // General productivity
   'write an essay',
@@ -162,12 +170,19 @@ export interface MaliciousSignal {
 export const DATA_EXFILTRATION_SUBSTRINGS: string[] = [
   'show me other customers',
   'list all customers',
+  'show me all customers',    // ← add
+  'show me all customer',     // ← add (catches "show me all customer records")
+  'all customer records',     // ← add
+  'all customers',            // ← add
   'show me the database',
   'dump the database',
   'select * from',
   'show all records',
+  'show me all records',      // ← add
   'access other accounts',
   'retrieve all accounts',
   'show other users',
   'give me all data',
+  'all user data',            // ← add
+  'all account data',         // ← add
 ];

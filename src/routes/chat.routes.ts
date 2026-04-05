@@ -1,7 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Chat Routes — updated for Phase 2, Slice 1
-// POST /api/chat/message now runs the full orchestration pipeline.
-// POST /api/chat/session is unchanged from Phase 1.5.
+// Chat Routes — Phase 2, Slice 2 update
+// Only change: processMessage now receives persistFn
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Router, Request, Response } from 'express';
@@ -13,79 +12,71 @@ import { processMessage }             from '../orchestrator/entry-route';
 
 const router = Router();
 
-// ---------------------------------------------------------------------------
-// POST /api/chat/session  (unchanged)
-// ---------------------------------------------------------------------------
-
-router.post(
-  '/session',
-  authMiddleware,
-  async (req: Request, res: Response): Promise<void> => {
-    try {
-      const { authUserId, email } = req.user!;
-      const customer = await resolveCustomer(authUserId, email);
-      const session  = await getOrCreateActiveSession(customer.customer_id);
-
-      res.json({
-        sessionId:     session.session_id,
-        status:        session.session_status,
-        currentCaseId: session.current_case_id,
-        startedAt:     session.started_at,
-      });
-    } catch (err: any) {
-      res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
-    }
+router.post('/session', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { authUserId, email } = req.user!;
+    const customer = await resolveCustomer(authUserId, email);
+    const session  = await getOrCreateActiveSession(customer.customer_id);
+    res.json({
+      sessionId:     session.session_id,
+      status:        session.session_status,
+      currentCaseId: session.current_case_id,
+      startedAt:     session.started_at,
+    });
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
   }
-);
+});
 
-// ---------------------------------------------------------------------------
-// POST /api/chat/message  (Phase 2 — full orchestration pipeline)
-// Body: { messageText: string }
-// ---------------------------------------------------------------------------
+router.post('/message', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { authUserId, email } = req.user!;
+    const { messageText }       = req.body;
 
-router.post(
-  '/message',
-  authMiddleware,
-  async (req: Request, res: Response): Promise<void> => {
-    try {
-      const { authUserId, email } = req.user!;
-      const { messageText }       = req.body;
+    if (!messageText || typeof messageText !== 'string' || messageText.trim() === '') {
+      res.status(400).json({ error: 'messageText is required and must be a non-empty string.' });
+      return;
+    }
 
-      // ── Input validation ────────────────────────────────────────────────
-      if (
-        !messageText ||
-        typeof messageText !== 'string' ||
-        messageText.trim() === ''
-      ) {
-        res.status(400).json({
-          error: 'messageText is required and must be a non-empty string.',
-        });
-        return;
-      }
+    const trimmedMessage = messageText.trim();
+    const customer = await resolveCustomer(authUserId, email);
+    const session  = await getOrCreateActiveSession(customer.customer_id);
 
-      const trimmedMessage = messageText.trim();
+    const { customer_id } = customer;
+    const { session_id }  = session;
 
-      // ── Resolve identity + session ──────────────────────────────────────
-      const customer = await resolveCustomer(authUserId, email);
-      const session  = await getOrCreateActiveSession(customer.customer_id);
+    // Persist user message before orchestration
+    await storeMessage({
+      sessionId:   session_id,
+      caseId:      session.current_case_id ?? null,
+      senderType:  'user',
+      messageText: trimmedMessage,
+    });
 
-      const { customer_id } = customer;
-      const { session_id }  = session;
-
-      // ── Persist user message ────────────────────────────────────────────
-      // Stored before orchestration so it exists in recent_messages context
-      // if the Intent Agent loads history mid-pipeline.
-      await storeMessage({
-        sessionId:   session_id,
-        caseId:      session.current_case_id ?? null,
-        senderType:  'user',
-        messageText: trimmedMessage,
+    // persistFn passed to entry-route so card-block branch can store its reply
+    const persistFn = async (params: {
+      sessionId:    string;
+      caseId:       string | null;
+      ticketId?:    string | null;
+      senderType:   'user' | 'assistant' | 'system';
+      messageText:  string;
+      responseMode?: string | null;
+    }) => {
+      return storeMessage({
+        sessionId:    params.sessionId,
+        caseId:       params.caseId,
+        ticketId:     params.ticketId ?? null,
+        senderType:   params.senderType,
+        messageText:  params.messageText,
+        responseMode: (params.responseMode as any) ?? null,
       });
+    };
 
-      // ── Run orchestration pipeline ──────────────────────────────────────
-      const result = await processMessage(customer_id, session_id, trimmedMessage);
+    const result = await processMessage(customer_id, session_id, trimmedMessage, persistFn);
 
-      // ── Persist assistant reply ─────────────────────────────────────────
+    // Persist assistant reply for non-card-block branches
+    // (card-block branch persists its own reply inside entry-route via persistFn)
+    if (!result.message_id) {
       const assistantMessage = await storeMessage({
         sessionId:    session_id,
         caseId:       result.case_id   ?? session.current_case_id ?? null,
@@ -94,33 +85,26 @@ router.post(
         messageText:  result.assistant_text,
         responseMode: result.response_mode,
       });
-
-      // ── Stamp message_id onto result ────────────────────────────────────
       result.message_id = assistantMessage.message_id;
-
-      // ── Return response ─────────────────────────────────────────────────
-      const responseBody: Record<string, unknown> = {
-        sessionId:    session_id,
-        messageId:    result.message_id,
-        reply:        result.assistant_text,
-        responseMode: result.response_mode,
-        caseId:       result.case_id   ?? null,
-        ticketId:     result.ticket_id ?? null,
-      };
-
-      // Include debug payload in non-production environments
-      if (process.env.NODE_ENV !== 'production' && result.debug) {
-        responseBody['debug'] = result.debug;
-      }
-
-      res.json(responseBody);
-
-    } catch (err: any) {
-      res.status(err.status ?? 500).json({
-        error: err.message ?? 'Internal server error.',
-      });
     }
+
+    const responseBody: Record<string, unknown> = {
+      sessionId:    session_id,
+      messageId:    result.message_id,
+      reply:        result.assistant_text,
+      responseMode: result.response_mode,
+      caseId:       result.case_id   ?? null,
+      ticketId:     result.ticket_id ?? null,
+    };
+
+    if (process.env.NODE_ENV !== 'production' && result.debug) {
+      responseBody['debug'] = result.debug;
+    }
+
+    res.json(responseBody);
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
   }
-);
+});
 
 export default router;
