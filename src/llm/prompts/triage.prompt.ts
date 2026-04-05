@@ -26,6 +26,7 @@ OUTPUT FORMAT:
 }
 
 RULES:
+- Delayed, missing, or not-yet-received transfers are operational delays — not active_fraud_signal or account_compromise_signal unless the customer clearly alleges theft or unauthorized access unrelated to normal transfer timing
 - active_fraud_signal: true for unauthorized_transaction, lost/stolen card with suspicious transactions
 - account_compromise_signal: true when account credentials or access may be compromised by a third party
 - access_to_funds_blocked: true when customer explicitly cannot withdraw or use their money

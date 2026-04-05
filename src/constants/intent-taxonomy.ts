@@ -296,6 +296,17 @@ export const OPERATIONAL_KEYWORD_RULES: KeywordRule[] = [
   },
 ];
 
+/** Physical loss or theft of the card — distinguishes stolen-card multi-issue from a single third-party fraud narrative. */
+export const PHYSICAL_CARD_LOSS_OR_THEFT_PHRASES: readonly string[] = [
+  'lost my card', 'lost my debit card', 'lost my credit card', 'lost my atm card',
+  'stolen card', 'card was stolen', 'lost card',
+  'my card is missing', 'my debit card is missing', 'my credit card is missing',
+  'i can\'t find my card', 'i cannot find my card', 'card theft',
+  'misplaced my card', 'report lost card', 'report my lost card',
+  'card stolen', 'card has been stolen', 'my card was stolen', 'my card has been stolen',
+  'lost and need to report', 'need to report my card',
+];
+
 // ---------------------------------------------------------------------------
 // Vague / ambiguous signal phrases
 // Presence of these without specific operational/informational context

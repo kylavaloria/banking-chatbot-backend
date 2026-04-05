@@ -22,7 +22,7 @@ import {
   CLARIFICATION_CANDIDATE_INTENTS, CONFIDENCE_THRESHOLDS,
   INFORMATIONAL_INTENTS, OPERATIONAL_INTENTS, resolveIntentGroup,
   KeywordRule, MULTI_ISSUE_PAIRS, MULTI_ISSUE_CONJUNCTION_PHRASES,
-  HYBRID_INFORMATIONAL_SIGNALS,
+  HYBRID_INFORMATIONAL_SIGNALS, PHYSICAL_CARD_LOSS_OR_THEFT_PHRASES,
 } from '../constants/intent-taxonomy';
 
 import {
@@ -476,6 +476,71 @@ async function classifyIntentRuleBased(input: IntentAgentInput): Promise<IntentR
 }
 
 // ---------------------------------------------------------------------------
+// Fraud-only multi_issue collapse (LLM over-splits one fraud narrative)
+// ---------------------------------------------------------------------------
+
+const FRAUD_MULTI_ISSUE_INTENTS = new Set<SupportedIntentType>([
+  'unauthorized_transaction',
+  'lost_or_stolen_card',
+]);
+
+function messageIndicatesPhysicalCardLossOrTheft(
+  normalizedText: string,
+  expandedText: string
+): boolean {
+  return PHYSICAL_CARD_LOSS_OR_THEFT_PHRASES.some(
+    p => normalizedText.includes(p) || expandedText.includes(p)
+  );
+}
+
+/**
+ * When the model returns multi_issue with only fraud-cluster components and the
+ * user did not mention physical loss/theft of the card, treat as one P1 fraud case.
+ */
+function collapseFraudOnlyFalseMultiIssue(
+  result: IntentResult,
+  normalizedText: string
+): void {
+  if (!result.flags.multi_issue && result.intent_type !== 'multi_issue_case') return;
+
+  const opComponents = result.issue_components.filter(c =>
+    OPERATIONAL_INTENTS.has(c.intent_type)
+  );
+  if (opComponents.length < 2) return;
+  if (!opComponents.every(c => FRAUD_MULTI_ISSUE_INTENTS.has(c.intent_type))) return;
+
+  const expandedText = expandContractions(normalizedText);
+  if (messageIndicatesPhysicalCardLossOrTheft(normalizedText, expandedText)) return;
+
+  const unauthorizedComp = opComponents.find(
+    c => c.intent_type === 'unauthorized_transaction'
+  );
+  const pick =
+    unauthorizedComp ??
+    opComponents.reduce((a, b) => (b.confidence > a.confidence ? b : a));
+  const maxConf = Math.max(...opComponents.map(c => c.confidence));
+
+  result.intent_type = 'unauthorized_transaction';
+  result.intent_group = 'operational';
+  result.flags.multi_issue = false;
+  result.secondary_intents = result.secondary_intents.filter(
+    t => !FRAUD_MULTI_ISSUE_INTENTS.has(t)
+  );
+  result.issue_components = [{
+    ...pick,
+    intent_type:  'unauthorized_transaction',
+    intent_group: 'operational',
+    confidence:   maxConf,
+    summary:
+      pick.summary ||
+      buildIssueSummary('unauthorized_transaction', pick.entities),
+  }];
+  result.evidence.push(
+    'Collapsed fraud-only multi_issue to single unauthorized_transaction (no physical card-loss phrasing)'
+  );
+}
+
+// ---------------------------------------------------------------------------
 // LLM-backed classification
 // ---------------------------------------------------------------------------
 
@@ -512,7 +577,12 @@ async function classifyIntentLLM(
       usage:      llmResponse.usage,
     };
 
-    return normalizeIntentResult(parsed);
+    const normalized = normalizeIntentResult(parsed);
+    collapseFraudOnlyFalseMultiIssue(
+      normalized,
+      input.userMessage.toLowerCase().trim()
+    );
+    return normalized;
   } catch (err) {
     console.warn(
       '[IntentAgent] LLM call failed, will use fallback',
