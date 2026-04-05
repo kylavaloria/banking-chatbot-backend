@@ -95,6 +95,7 @@ router.post('/message', authMiddleware, async (req: Request, res: Response): Pro
       responseMode: result.response_mode,
       caseId:       result.case_id   ?? null,
       ticketId:     result.ticket_id ?? null,
+      ticketIds: result.ticket_ids ?? [],
     };
 
     if (process.env.NODE_ENV !== 'production' && result.debug) {
