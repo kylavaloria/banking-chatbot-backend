@@ -368,3 +368,44 @@ export const CARD_BLOCK_DECLINE_PHRASES: string[] = [
   'skip', 'cancel', 'nevermind', 'never mind', 'not now', 'decline',
   'i will keep it', 'keep it active', 'no need', 'not necessary',
 ];
+
+// ── Slice 3 additions ─────────────────────────────────────────────────────────
+
+/**
+ * Pairs of operational intents that commonly appear together in a single message.
+ * Used for conservative multi-issue detection.
+ * Each entry is [intentA, intentB] — order does not matter during matching.
+ */
+export const MULTI_ISSUE_PAIRS: Array<[SupportedIntentType, SupportedIntentType]> = [
+  ['unauthorized_transaction',   'lost_or_stolen_card'],
+  ['unauthorized_transaction',   'account_access_issue'],
+  ['unauthorized_transaction',   'account_restriction_issue'],
+  ['lost_or_stolen_card',        'account_access_issue'],
+  ['failed_or_delayed_transfer', 'billing_or_fee_dispute'],
+  ['failed_or_delayed_transfer', 'refund_or_reversal_issue'],
+  ['account_access_issue',       'account_restriction_issue'],
+  ['refund_or_reversal_issue',   'billing_or_fee_dispute'],
+];
+
+/**
+ * Conjunction phrases that signal the user is describing multiple issues.
+ * Presence of one of these increases multi-issue detection confidence.
+ */
+export const MULTI_ISSUE_CONJUNCTION_PHRASES: string[] = [
+  ' and also ', ' and i also ', ' and there are ', ' and there is ',
+  ' also, ', ' additionally, ', ' furthermore, ', ' on top of that, ',
+  ' as well as ', ' plus ', ' in addition ',
+];
+
+/**
+ * Keyword phrases that signal an informational component within a hybrid message.
+ * Presence of one of these alongside an operational keyword suggests hybrid = true.
+ */
+export const HYBRID_INFORMATIONAL_SIGNALS: string[] = [
+  'what is your', 'what are your', 'what is the', 'what are the',
+  'how does', 'how do', 'can you tell me', 'do you have',
+  'tell me about', 'i want to know', 'what is the policy',
+  'how long does it take', 'what are the requirements',
+  'what are the fees', 'what are the charges', 'what are the rates',
+  'what are your hours', 'where is your branch', 'branch hours',
+];
