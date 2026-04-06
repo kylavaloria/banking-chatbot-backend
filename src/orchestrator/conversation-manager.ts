@@ -1,20 +1,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Conversation Manager — Slice 4: uses triageIntentAsync for LLM hybrid triage
-// Fixes applied:
-//   - await generateResponse() (now async)
-//   - ctx.user_message instead of conversation.user_message
+// Conversation Manager — Slice 5: RAG for informational branch
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { PipelineContext, OrchestratorResult } from '../contracts/orchestration.contract';
 import type { ClarificationContext }                from '../agents/intent.agent';
 
-import { triageIntent, triageIntentAsync } from '../agents/triage.agent';
-import { decide }                          from '../agents/policy.agent';
-import { executeAction }                   from '../agents/action.agent';
-import { generateResponse }                from '../agents/response.agent';
-
-const PLACEHOLDER_INFORMATIONAL =
-  'Our team will provide you with the relevant information on that topic shortly.';
+import { triageIntentAsync }   from '../agents/triage.agent';
+import { decide }              from '../agents/policy.agent';
+import { executeAction }       from '../agents/action.agent';
+import { generateResponse }    from '../agents/response.agent';
+import { answerInformational } from '../rag/index';
+import { env }                 from '../config/env';
 
 export async function runConversationManager(
   ctx: PipelineContext,
@@ -43,27 +39,36 @@ export async function runConversationManager(
       };
       const policyOutput = decide(fallbackIntent);
       const actionResult = await executeAction({
-        context:        conversation,
-        intentResult:   fallbackIntent,
-        policyDecision: policyOutput.decision,
-        plan:           policyOutput.plan,
+        context: conversation, intentResult: fallbackIntent,
+        policyDecision: policyOutput.decision, plan: policyOutput.plan,
       });
-      // Fix 1: await generateResponse (now async)
       const assistantText = await generateResponse({
-        actionResult,
-        intentResult:  fallbackIntent,
-        policyOutput,
-        clarificationContext,
+        actionResult, intentResult: fallbackIntent, policyOutput, clarificationContext,
       });
       ctx.assistant_text = assistantText;
       return {
-        assistant_text: assistantText,
-        response_mode:  actionResult.response_mode,
-        session_id:     conversation.session_id,
-        message_id:     '',
-        case_id:        actionResult.case_id  ?? null,
-        ticket_id:      actionResult.ticket_id ?? null,
+        assistant_text: assistantText, response_mode: actionResult.response_mode,
+        session_id: conversation.session_id, message_id: '',
+        case_id: actionResult.case_id ?? null, ticket_id: actionResult.ticket_id ?? null,
       };
+    }
+
+    // Slice 5: RAG for the informational component of hybrid messages
+    const informationalComponent = intent_result.issue_components.find(
+      c => c.intent_group === 'informational'
+    );
+    let hybridInformationalAnswer =
+      'Our team will provide you with the relevant information on that topic shortly.';
+
+    if (informationalComponent && env.NODE_ENV !== 'test') {
+      try {
+        const ragAnswer = await answerInformational(
+          informationalComponent.summary || (ctx.user_message ?? '')
+        );
+        hybridInformationalAnswer = ragAnswer.answer_text;
+      } catch (err) {
+        console.warn('[ConversationManager] RAG failed for hybrid informational component', err instanceof Error ? err.message : err);
+      }
     }
 
     const syntheticIntent = {
@@ -72,7 +77,6 @@ export async function runConversationManager(
       flags: { ...intent_result.flags, hybrid: false },
     };
 
-    // Fix 2: read user_message from ctx (PipelineContext), not conversation (ConversationContext)
     const triageResult  = await triageIntentAsync(syntheticIntent, ctx.user_message ?? '');
     ctx.triage_result   = triageResult;
 
@@ -80,39 +84,26 @@ export async function runConversationManager(
     ctx.policy_decision = policyOutput.decision;
 
     const actionResult = await executeAction({
-      context:        conversation,
-      intentResult:   syntheticIntent,
-      triageResult,
-      policyDecision: policyOutput.decision,
-      plan:           policyOutput.plan,
+      context: conversation, intentResult: syntheticIntent,
+      triageResult, policyDecision: policyOutput.decision, plan: policyOutput.plan,
     });
     ctx.action_result = actionResult;
 
-    // Fix 1: await generateResponse
     const assistantText = await generateResponse({
-      actionResult,
-      intentResult:              syntheticIntent,
-      triageResult,
-      policyOutput,
-      clarificationContext,
-      hybridInformationalAnswer: PLACEHOLDER_INFORMATIONAL,
+      actionResult, intentResult: syntheticIntent, triageResult, policyOutput,
+      clarificationContext, hybridInformationalAnswer,
     });
     ctx.assistant_text = assistantText;
 
     const result: OrchestratorResult = {
-      assistant_text: assistantText,
-      response_mode:  actionResult.response_mode,
-      session_id:     conversation.session_id,
-      message_id:     '',
-      case_id:        actionResult.case_id  ?? null,
-      ticket_id:      actionResult.ticket_id ?? null,
+      assistant_text: assistantText, response_mode: actionResult.response_mode,
+      session_id: conversation.session_id, message_id: '',
+      case_id: actionResult.case_id ?? null, ticket_id: actionResult.ticket_id ?? null,
     };
     if (process.env.NODE_ENV !== 'production') {
       result.debug = {
-        intent_result,
-        triage_result:   triageResult,
-        policy_decision: policyOutput.decision,
-        action_result:   actionResult,
+        intent_result, triage_result: triageResult,
+        policy_decision: policyOutput.decision, action_result: actionResult,
       };
     }
     return result;
@@ -122,7 +113,6 @@ export async function runConversationManager(
 
   let triageResult = ctx.triage_result;
   if (intent_result.intent_group === 'operational') {
-    // Fix 2: ctx.user_message, not conversation.user_message
     triageResult      = await triageIntentAsync(intent_result, ctx.user_message ?? '');
     ctx.triage_result = triageResult;
   }
@@ -131,17 +121,41 @@ export async function runConversationManager(
   ctx.policy_decision = policyOutput.decision;
 
   const actionResult = await executeAction({
-    context:        conversation,
-    intentResult:   intent_result,
-    triageResult,
-    policyDecision: policyOutput.decision,
-    plan:           policyOutput.plan,
+    context: conversation, intentResult: intent_result,
+    triageResult, policyDecision: policyOutput.decision, plan: policyOutput.plan,
   });
   ctx.action_result = actionResult;
 
-  // Fix 1: await generateResponse
+  // ── Slice 5: RAG for pure informational queries ───────────────────────────
+  let ragAnswerText: string | null = null;
+  if (
+    intent_result.intent_group === 'informational' &&
+    actionResult.response_mode === 'informational' &&
+    env.NODE_ENV !== 'test'
+  ) {
+    try {
+      const ragAnswer = await answerInformational(ctx.user_message ?? '');
+      if (!ragAnswer.is_fallback) {
+        ragAnswerText = ragAnswer.answer_text;
+      }
+    } catch (err) {
+      console.warn('[ConversationManager] RAG failed', err instanceof Error ? err.message : err);
+    }
+  }
+
+  // Inject RAG answer into the action result if we got one
+  const enrichedActionResult = ragAnswerText
+    ? {
+      ...actionResult,
+      informational_payload: {
+        answer_text: ragAnswerText,
+        source_mode: 'rag' as const,
+      },
+    }
+    : actionResult;
+
   const assistantText = await generateResponse({
-    actionResult,
+    actionResult:  enrichedActionResult,
     intentResult:  intent_result,
     triageResult,
     policyOutput,
@@ -152,23 +166,20 @@ export async function runConversationManager(
 
   const result: OrchestratorResult = {
     assistant_text: assistantText,
-    response_mode:  actionResult.response_mode,
+    response_mode:  enrichedActionResult.response_mode,
     session_id:     conversation.session_id,
     message_id:     '',
-    case_id:        actionResult.case_id  ?? null,
-    ticket_id:      actionResult.ticket_id ?? null,
-    ticket_ids:     actionResult.created_ticket_ids?.length
-                      ? actionResult.created_ticket_ids
-                      : undefined,
+    case_id:        enrichedActionResult.case_id  ?? null,
+    ticket_id:      enrichedActionResult.ticket_id ?? null,
+    ticket_ids:     enrichedActionResult.created_ticket_ids?.length
+      ? enrichedActionResult.created_ticket_ids : undefined,
     topic_switched: topicSwitched || undefined,
   };
 
   if (process.env.NODE_ENV !== 'production') {
     result.debug = {
-      intent_result,
-      triage_result:   triageResult,
-      policy_decision: policyOutput.decision,
-      action_result:   actionResult,
+      intent_result, triage_result: triageResult,
+      policy_decision: policyOutput.decision, action_result: enrichedActionResult,
     };
   }
   return result;

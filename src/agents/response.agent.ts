@@ -321,6 +321,12 @@ export async function generateResponse(input: ResponseAgentInput): Promise<strin
     return renderTemplate(responseInput, extra);
   }
 
+  // Informational: use RAG or action-agent placeholder text verbatim (template wrap only).
+  // Mistral is not given the KB facts in its brief; paraphrase would distort amounts/currency.
+  if (input.actionResult.response_mode === 'informational') {
+    return renderTemplate(responseInput, extra);
+  }
+
   const llmText = await generateWithMistral(responseInput, extra);
   if (llmText) return llmText;
 
