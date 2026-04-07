@@ -8,7 +8,8 @@
     "start": "node dist/server.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "ingest-kb": "ts-node scripts/ingest-kb.ts"
+    "ingest-kb": "ts-node scripts/ingest-kb.ts",
+    "sla-job":   "ts-node src/jobs/run-sla-job.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
