@@ -4,3 +4,4 @@ node_modules/
 dist/
 login.ts
 login.ps1
+data/
