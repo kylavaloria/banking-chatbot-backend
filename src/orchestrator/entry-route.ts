@@ -313,7 +313,7 @@ export async function processMessage(
         execution_summary:     [`card_block_${cardBlockOutcome}`],
       };
 
-      const assistantText = generateResponse({
+      const assistantText = await generateResponse({
         actionResult:    stubActionResult,
         intentResult:    stubIntentResult,
         policyOutput:    stubPolicyOutput,
