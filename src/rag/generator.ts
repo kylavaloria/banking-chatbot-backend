@@ -4,7 +4,7 @@
 // Uses Groq (llama-3.1-8b) — fast and free-tier friendly for short answers.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { callGroq }    from '../llm/groq.client';
+import { callGemini } from '../llm/gemini.client';
 import { env }         from '../config/env';
 import type { ScoredChunk, RAGAnswer } from './types';
 
@@ -43,7 +43,7 @@ export async function generateRAGAnswer(
   const userContent = `Knowledge base excerpts:\n${context}\n\nCustomer question: ${query}\n\nAnswer:`;
 
   try {
-    const response = await callGroq({
+    const response = await callGemini({
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user',   content: userContent },

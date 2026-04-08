@@ -13,7 +13,7 @@ import type {
   Priority, RecommendedPath, TriageOverrideReason,
 } from '../contracts/triage.contract';
 
-import { callGroq }             from '../llm/groq.client';
+import { callGemini }           from '../llm/gemini.client';
 import { extractJSON }          from '../utils/json-extract';
 import { buildTriageMessages }  from '../llm/prompts/triage.prompt';
 import { env }                  from '../config/env';
@@ -102,11 +102,11 @@ async function extractSignalsLLM(
   try {
     const messages = buildTriageMessages(userMessage, intentResult);
 
-    const llmResponse = await callGroq({
+    const llmResponse = await callGemini({
       messages,
       model:       env.TRIAGE_MODEL,
       temperature: 0.1,
-      maxTokens:   512,
+      maxTokens:   1024,
     });
 
     const parsed = extractJSON(llmResponse.text);

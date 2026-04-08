@@ -1,13 +1,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Intent Agent — Slice 4: LLM-backed with deterministic fallback
+// Intent Agent — Slice 4 + informational pre-check + Gemini intent model
 //
 // Execution order:
 //   1. Deterministic security pre-checks (malicious / out-of-scope)
-//   2. Deterministic structural pre-checks (hybrid + multi-issue)
-//   3. isSimpleMessage routing → select model
-//   4. LLM call (Groq) for single-intent messages
-//   5. JSON extraction + normalizeIntentResult()
-//   6. Fallback to rule-based classifier on any failure
+//   2. Informational override pre-check — two-tier:
+//      Tier 1: strong interrogative starters (What is/are, How does/do/long,
+//              Can you explain, Do you have, etc.) — always informational
+//              unless a conjunction + operational keyword is also present
+//      Tier 2: specific regex patterns — only informational if no strong
+//              operational keyword match
+//   3. Deterministic structural pre-checks (hybrid + multi-issue)
+//   4. isSimpleMessage routing → select model
+//   5. LLM call (Gemini gemini-2.0-flash) for single-intent messages
+//   6. JSON extraction + normalizeIntentResult()
+//   7. Fallback to rule-based classifier on any failure
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type {
@@ -35,7 +41,7 @@ import {
   normalizeIntentResult, buildFallbackIntentResult, normalizeEntities,
 } from '../utils/normalizers';
 
-import { callGroq }            from '../llm/groq.client';
+import { callGemini }          from '../llm/gemini.client';
 import { extractJSON }         from '../utils/json-extract';
 import { buildIntentMessages } from '../llm/prompts/intent.prompt';
 import { env }                 from '../config/env';
@@ -64,7 +70,7 @@ interface ClassificationMatch {
 }
 
 // ---------------------------------------------------------------------------
-// Contraction expansion (used by multiple functions below)
+// Contraction expansion
 // ---------------------------------------------------------------------------
 
 function expandContractions(text: string): string {
@@ -105,9 +111,9 @@ function runKeywordClassification(
     );
     if (!bestMatch || confidence > bestMatch.confidence) {
       bestMatch = {
-        intent:     rule.intent,
+        intent:   rule.intent,
         confidence,
-        evidence:   `Matched: "${matched.slice(0, 3).join('", "')}"`,
+        evidence: `Matched: "${matched.slice(0, 3).join('", "')}"`,
       };
     }
   }
@@ -133,9 +139,9 @@ function runAllOperationalMatches(
     );
     if (confidence >= minConfidence) {
       results.push({
-        intent:     rule.intent,
+        intent:   rule.intent,
         confidence,
-        evidence:   `Matched: "${matched.slice(0, 2).join('", "')}"`,
+        evidence: `Matched: "${matched.slice(0, 2).join('", "')}"`,
       });
       seen.add(rule.intent);
     }
@@ -144,18 +150,85 @@ function runAllOperationalMatches(
 }
 
 // ---------------------------------------------------------------------------
+// Informational override pre-check (Step 2.5)
+//
+// Tier 1 — STRONG interrogative starters
+// These sentence structures are unambiguously questions/inquiries.
+// "What is your refund policy" cannot be a complaint even if "refund" is
+// an operational keyword. Override fires unless a conjunction phrase is
+// also present (hybrid case).
+//
+// Tier 2 — specific pattern-based overrides
+// Only fire when no strong operational keyword is also present.
+// ---------------------------------------------------------------------------
+
+const STRONG_INTERROGATIVE_STARTERS: RegExp[] = [
+  // "What is/are [your/the/a] ..."
+  /^what (is|are) (your|the) /i,
+  /^what (is|are) a /i,
+  /^what (is|are) an /i,
+  // "What do/does X mean/include/require/cover ..."
+  /^what (do|does) .{0,30} (mean|include|cover|require|involve|offer|provide)/i,
+  // "How does/do ..."
+  /^how (does|do) /i,
+  // "How long ..."
+  /^how long /i,
+  // "How much ..."
+  /^how much /i,
+  // "How can/could/would/should I ..."
+  /^how (can|could|would|should) i /i,
+  // "How is/are ..."
+  /^how (is|are) /i,
+  // "Can you explain/tell/describe/clarify ..."
+  /^can you (explain|tell|describe|clarify|help me understand)/i,
+  // "Tell me about/how/what ..."
+  /^tell me (about|how|what)/i,
+  // "Do you have/offer/provide/support ..."
+  /^do you (have|offer|provide|support|allow|accept)/i,
+  // "Is there a/an ..."
+  /^is there (a|an) /i,
+  // "Are there any ..."
+  /^are there (any|some) /i,
+  // "What happens if/when ..."
+  /^what happens (if|when) /i,
+  // "Who do/should/can I contact/call/reach ..."
+  /^who (do i|should i|can i) (contact|call|reach|talk)/i,
+  // "Where is/are your ..."
+  /^where (is|are) (your|the) /i,
+  // "When does/is/are ..."
+  /^when (does|is|are) /i,
+];
+
+const INFORMATIONAL_OVERRIDE_PATTERNS: RegExp[] = [
+  // Tier 2 — specific patterns (op keyword guard applies)
+  /kyc (process|requirements|procedure|steps)/i,
+  /what do i need (to provide |to submit )?(for )?kyc/i,
+  /(branch|office|atm) (hours|schedule|location|address)/i,
+  /(customer|support) (service |support )?(channels?|hotline|number|contact)/i,
+];
+
+function detectInformationalOverride(
+  normalizedText: string
+): { override: boolean; strong: boolean } {
+  if (STRONG_INTERROGATIVE_STARTERS.some(p => p.test(normalizedText))) {
+    return { override: true, strong: true };
+  }
+  if (INFORMATIONAL_OVERRIDE_PATTERNS.some(p => p.test(normalizedText))) {
+    return { override: true, strong: false };
+  }
+  return { override: false, strong: false };
+}
+
+// ---------------------------------------------------------------------------
 // Simple message routing heuristic
-// Deterministic — no LLM involved in this decision.
 // ---------------------------------------------------------------------------
 
 export function isSimpleMessage(normalizedText: string): boolean {
-  // Conjunction phrases signal multiple issues
   const hasConjunction = MULTI_ISSUE_CONJUNCTION_PHRASES.some(p =>
     normalizedText.includes(p)
   );
   if (hasConjunction) return false;
 
-  // Hybrid signal only disqualifies when an operational keyword is also present
   const hasHybridSignal = HYBRID_INFORMATIONAL_SIGNALS.some(s =>
     normalizedText.includes(s)
   );
@@ -165,16 +238,13 @@ export function isSimpleMessage(normalizedText: string): boolean {
     if (hasOpKeyword) return false;
   }
 
-  // Two or more distinct operational keyword matches → likely multi-issue
   const expandedText = expandContractions(normalizedText);
   const allOpMatches = runAllOperationalMatches(normalizedText, expandedText);
   if (allOpMatches.length >= 2) return false;
 
-  // Long messages are more likely to carry complexity
   const wordCount = normalizedText.split(/\s+/).length;
   if (wordCount > 20) return false;
 
-  // References to prior interactions suggest topic-switch complexity
   if (/\b(earlier|before|previously|last time|my other|another case)\b/i.test(normalizedText)) {
     return false;
   }
@@ -183,7 +253,7 @@ export function isSimpleMessage(normalizedText: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic security checks (run before any LLM call)
+// Deterministic security checks
 // ---------------------------------------------------------------------------
 
 function detectMaliciousSignal(normalizedText: string): MaliciousSignal {
@@ -319,7 +389,7 @@ function buildIssueSummary(
 }
 
 // ---------------------------------------------------------------------------
-// Rule-based fallback classifier (Slice 3 — used when LLM fails)
+// Rule-based fallback classifier
 // ---------------------------------------------------------------------------
 
 async function classifyIntentRuleBased(input: IntentAgentInput): Promise<IntentResult> {
@@ -452,11 +522,11 @@ async function classifyIntentRuleBased(input: IntentAgentInput): Promise<IntentR
     secondary_intents: [],
     entities,
     flags: {
-      ambiguous:      isAmbiguous,
-      multi_issue:    false,
-      hybrid:         false,
-      topic_switch:   consistency === 'new_issue' || consistency === 'possible_topic_switch',
-      malicious_input:false,
+      ambiguous:       isAmbiguous,
+      multi_issue:     false,
+      hybrid:          false,
+      topic_switch:    consistency === 'new_issue' || consistency === 'possible_topic_switch',
+      malicious_input: false,
     },
     issue_components: intentType !== 'unclear_issue' && intentType !== 'unsupported_request'
       ? [{
@@ -476,7 +546,7 @@ async function classifyIntentRuleBased(input: IntentAgentInput): Promise<IntentR
 }
 
 // ---------------------------------------------------------------------------
-// Fraud-only multi_issue collapse (LLM over-splits one fraud narrative)
+// Fraud-only multi_issue collapse
 // ---------------------------------------------------------------------------
 
 const FRAUD_MULTI_ISSUE_INTENTS = new Set<SupportedIntentType>([
@@ -493,10 +563,6 @@ function messageIndicatesPhysicalCardLossOrTheft(
   );
 }
 
-/**
- * When the model returns multi_issue with only fraud-cluster components and the
- * user did not mention physical loss/theft of the card, treat as one P1 fraud case.
- */
 function collapseFraudOnlyFalseMultiIssue(
   result: IntentResult,
   normalizedText: string
@@ -520,8 +586,8 @@ function collapseFraudOnlyFalseMultiIssue(
     opComponents.reduce((a, b) => (b.confidence > a.confidence ? b : a));
   const maxConf = Math.max(...opComponents.map(c => c.confidence));
 
-  result.intent_type = 'unauthorized_transaction';
-  result.intent_group = 'operational';
+  result.intent_type    = 'unauthorized_transaction';
+  result.intent_group   = 'operational';
   result.flags.multi_issue = false;
   result.secondary_intents = result.secondary_intents.filter(
     t => !FRAUD_MULTI_ISSUE_INTENTS.has(t)
@@ -541,7 +607,7 @@ function collapseFraudOnlyFalseMultiIssue(
 }
 
 // ---------------------------------------------------------------------------
-// LLM-backed classification
+// LLM-backed classification — Gemini
 // ---------------------------------------------------------------------------
 
 async function classifyIntentLLM(
@@ -556,11 +622,11 @@ async function classifyIntentLLM(
       input.clarificationContext ?? null
     );
 
-    const llmResponse = await callGroq({
+    const llmResponse = await callGemini({
       messages,
       model,
       temperature: 0.1,
-      maxTokens:   1024,
+      maxTokens:   2048,
     });
 
     const parsed = extractJSON(llmResponse.text);
@@ -647,9 +713,69 @@ export async function classifyIntent(input: IntentAgentInput): Promise<IntentRes
     });
   }
 
+  // ── Step 2.5: Informational override pre-check ────────────────────────────
+  // Tier 1 — strong interrogative starters (What is/are, How does/do/long,
+  //           Can you explain, Do you have, etc.)
+  //           Always returns informational UNLESS a conjunction phrase is
+  //           also present (indicating a hybrid message like
+  //           "What are your hours, and also my transfer failed").
+  //
+  // Tier 2 — specific regex patterns
+  //           Returns informational only if no strong operational keyword match.
+  const overrideResult = detectInformationalOverride(normalizedText);
+
+  if (overrideResult.override) {
+    const expandedText   = expandContractions(normalizedText);
+    const hasConjunction = MULTI_ISSUE_CONJUNCTION_PHRASES.some(p =>
+      normalizedText.includes(p)
+    );
+
+    // Conjunction present → likely hybrid, fall through to structural checks
+    if (!hasConjunction) {
+      const opMatches   = runAllOperationalMatches(normalizedText, expandedText);
+      const hasStrongOp = opMatches.length > 0 &&
+        opMatches[0].confidence >= CONFIDENCE_THRESHOLDS.ACCEPT;
+
+      // Tier 1: always informational (question structure overrides op noun)
+      // Tier 2: only informational if no strong op keyword
+      if (overrideResult.strong || !hasStrongOp) {
+        const bestInfo   = runKeywordClassification(
+          normalizedText, expandedText, INFORMATIONAL_KEYWORD_RULES
+        );
+        const intentType = bestInfo?.intent ?? 'policy_or_process_inquiry' as SupportedIntentType;
+        const confidence = bestInfo?.confidence ?? 0.90;
+        const entities   = extractEntities(userMessage);
+        const group      = resolveIntentGroup(intentType);
+
+        return normalizeIntentResult({
+          intent_type:  intentType,
+          intent_group: group,
+          confidence,
+          secondary_intents: [],
+          entities,
+          flags: {
+            ambiguous: false, multi_issue: false, hybrid: false,
+            topic_switch: false, malicious_input: false,
+          },
+          issue_components: [{
+            intent_type:  intentType,
+            intent_group: group,
+            confidence,
+            entities,
+            summary: buildIssueSummary(intentType, entities),
+          }],
+          candidate_intents_for_clarification: [],
+          consistency_with_active_case: activeCase ? 'same_case' : 'no_active_case',
+          evidence: [
+            `Informational override (${overrideResult.strong ? 'strong' : 'pattern'}): "${normalizedText.slice(0, 80)}"`,
+          ],
+        });
+      }
+    }
+    // Falls through if conjunction present or Tier 2 with strong op keyword
+  }
+
   // ── Step 3: Structural pre-checks (hybrid + multi-issue) ─────────────────
-  // These remain deterministic regardless of LLM. Multi-issue and hybrid
-  // decomposition must be consistent across runs — LLM is not used here.
   const expandedText  = expandContractions(normalizedText);
   const allOpMatches  = runAllOperationalMatches(normalizedText, expandedText);
   const bestOpMatch   = allOpMatches[0] ?? null;
@@ -657,7 +783,7 @@ export async function classifyIntent(input: IntentAgentInput): Promise<IntentRes
     normalizedText, expandedText, INFORMATIONAL_KEYWORD_RULES
   );
 
-  // Hybrid pre-check: clear informational signal + strong operational match
+  // Hybrid pre-check
   if (bestOpMatch && bestInfoMatch &&
       bestOpMatch.confidence >= CONFIDENCE_THRESHOLDS.ACCEPT) {
     const hasHybridSignal = HYBRID_INFORMATIONAL_SIGNALS.some(s =>
@@ -701,7 +827,7 @@ export async function classifyIntent(input: IntentAgentInput): Promise<IntentRes
     }
   }
 
-  // Multi-issue pre-check: 2+ distinct operational intents with pair or conjunction
+  // Multi-issue pre-check
   if (allOpMatches.length >= 2) {
     const hasConjunction = MULTI_ISSUE_CONJUNCTION_PHRASES.some(p =>
       normalizedText.includes(p)
@@ -713,7 +839,12 @@ export async function classifyIntent(input: IntentAgentInput): Promise<IntentRes
     const highConf = allOpMatches.filter(
       m => m.confidence >= CONFIDENCE_THRESHOLDS.ACCEPT
     );
-    if (hasPair || (hasConjunction && highConf.length >= 2)) {
+    // Word-count guard: short vague messages lack the specificity needed
+    // for reliable multi-issue detection — let LLM handle them
+    const wordCount  = normalizedText.split(/\s+/).length;
+    const isTooVague = wordCount <= 9;
+
+    if (!isTooVague && (hasPair || (hasConjunction && highConf.length >= 2))) {
       const top2     = [...allOpMatches]
         .sort((a, b) => b.confidence - a.confidence)
         .slice(0, 2);
@@ -745,12 +876,12 @@ export async function classifyIntent(input: IntentAgentInput): Promise<IntentRes
     }
   }
 
-  // ── Step 4: LLM routing + call (single-intent messages only) ─────────────
+  // ── Step 4: LLM routing + call ────────────────────────────────────────────
   const useSimpleRouting = env.INTENT_USE_SIMPLE_ROUTING !== 'false';
   const simple = isSimpleMessage(normalizedText);
   const model  = useSimpleRouting && simple
-    ? env.FALLBACK_INTENT_MODEL   // llama-3.1-8b-instant
-    : env.PRIMARY_INTENT_MODEL;   // llama-3.3-70b-versatile
+    ? env.FALLBACK_INTENT_MODEL
+    : env.PRIMARY_INTENT_MODEL;
 
   if (env.NODE_ENV !== 'test') {
     const llmResult = await classifyIntentLLM(input, model);

@@ -114,6 +114,12 @@ export const INFORMATIONAL_KEYWORD_RULES: KeywordRule[] = [
       'where is', 'how do i find', 'open on weekends', 'branch address',
       'operating hours', 'call center', 'hotline number', 'contact number',
       'customer service number',
+      // S15: contact/support channel queries are informational
+      'how can i contact', 'how do i contact', 'how to contact',
+      'how to reach', 'how can i reach', 'contact customer support',
+      'contact support', 'reach customer service', 'get support',
+      'support channels', 'support options', 'ways to contact',
+      'customer support channels', 'how to get help',
     ],
     intent: 'branch_or_service_info',
     baseConfidence: 0.88,
@@ -134,14 +140,19 @@ export const INFORMATIONAL_KEYWORD_RULES: KeywordRule[] = [
   // policy_or_process_inquiry
   {
     keywords: [
-      'how does it work', 'what is the process', 'how long does it take',
-      'processing time', 'what happens if', 'policy on', 'bank policy',
-      'terms and conditions', 'how to dispute', 'how to request',
-      'what is the procedure', 'clearing period', 'hold period',
-      'how to cancel', 'how to close my account',
+      'what is your refund policy', 'what is the refund policy',
+      'what is your policy', 'what is the policy',
+      'how do i dispute', 'how can i dispute',
+      'how do i report a', 'how do i file a',
+      'how do i request', 'how to dispute',
+      'what is your reversal policy',
+      'what is the process for',
+      'how does the dispute process work',
+      'how do i make a complaint',
+      'what is the procedure for',
     ],
     intent: 'policy_or_process_inquiry',
-    baseConfidence: 0.87,
+    baseConfidence: 0.95,
   },
 
   // product_info
@@ -240,8 +251,12 @@ export const OPERATIONAL_KEYWORD_RULES: KeywordRule[] = [
       'account restricted', 'account blocked', 'account frozen',
       'account on hold', 'transaction limit', 'limit reached',
       'my account is blocked', 'why is my account restricted',
-      'account flagged', 'kyc', 'know your customer', 'account verification required',
+      'account flagged', 'account verification required',
       'my transactions are blocked',
+      // KYC only as an active account restriction signal
+      'kyc hold', 'kyc block', 'account suspended for kyc',
+      'kyc not completed', 'failed kyc', 'kyc rejected',
+      'account restricted due to kyc', 'kyc verification required for my account',
     ],
     intent: 'account_restriction_issue',
     baseConfidence: 0.90,
@@ -290,9 +305,18 @@ export const OPERATIONAL_KEYWORD_RULES: KeywordRule[] = [
       'proof of account', 'certificate of deposit', 'loan certificate',
       'request a document', 'i need a document', 'certification', 'soa',
       'statement request', 'account balance certificate',
+      // S24: "I need a statement" is a request not an inquiry
+      'i need a bank certificate', 'i need a statement of account',
+      'i need a bank statement', 'i need an account statement',
+      'i need a certificate', 'i need a loan certificate',
+      'i need proof of account', 'i need a balance certificate',
+      'please provide me a statement', 'can i request a statement',
+      'can i get a bank certificate', 'i want to request a certificate',
+      'i would like a statement', 'i would like a bank certificate',
+      'get a statement of account', 'obtain a bank certificate',
     ],
     intent: 'document_or_certification_request',
-    baseConfidence: 0.89,
+    baseConfidence: 0.91,
   },
 ];
 
