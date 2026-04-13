@@ -35,7 +35,7 @@ import {
   normalizeIntentResult, buildFallbackIntentResult, normalizeEntities,
 } from '../utils/normalizers';
 
-import { callGroq }            from '../llm/groq.client';
+import { callGemini }           from '../llm/gemini.client';
 import { extractJSON }         from '../utils/json-extract';
 import { buildIntentMessages } from '../llm/prompts/intent.prompt';
 import { env }                 from '../config/env';
@@ -556,7 +556,7 @@ async function classifyIntentLLM(
       input.clarificationContext ?? null
     );
 
-    const llmResponse = await callGroq({
+    const llmResponse = await callGemini({
       messages,
       model,
       temperature: 0.1,
