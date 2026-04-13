@@ -70,7 +70,7 @@ router.get('/messages', authMiddleware, async (req: Request, res: Response): Pro
 
     const { data, error } = await serviceClient
       .from('messages')
-      .select('message_id, sender_type, message_text, response_mode, created_at')
+      .select('message_id, sender_type, message_text, response_mode, case_id, ticket_id, created_at')
       .eq('session_id', session.session_id)
       .order('created_at', { ascending: true })
       .limit(50); // last 50 messages
@@ -170,6 +170,48 @@ router.post('/message', authMiddleware, async (req: Request, res: Response): Pro
     }
 
     res.json(responseBody);
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
+  }
+});
+
+// GET /api/chat/tickets?caseIds=id1,id2,id3
+router.get('/tickets', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const raw = req.query['caseIds'];
+    if (!raw || typeof raw !== 'string') {
+      res.json({ tickets: [] });
+      return;
+    }
+
+    const caseIds = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if (caseIds.length === 0) {
+      res.json({ tickets: [] });
+      return;
+    }
+
+    const { data, error } = await serviceClient
+      .from('tickets')
+      .select(`
+        ticket_id,
+        case_id,
+        issue_type,
+        status,
+        cases ( summary )
+      `)
+      .in('case_id', caseIds);
+
+    if (error) throw { status: 500, message: 'Failed to fetch ticket details.' };
+
+    const tickets = (data ?? []).map((row: any) => ({
+      ticket_id:  row.ticket_id,
+      case_id:    row.case_id,
+      issue_type: row.issue_type,
+      status:     row.status,
+      summary:    row.cases?.summary ?? '',
+    }));
+
+    res.json({ tickets });
   } catch (err: any) {
     res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
   }
