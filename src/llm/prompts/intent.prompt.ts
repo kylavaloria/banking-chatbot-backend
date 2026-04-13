@@ -2,9 +2,9 @@
 // Intent classification prompt
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { LLMMessage }       from '../types';
-import type { ActiveCaseContext, RecentMessage } from '../../contracts/orchestration.contract';
-import type { ClarificationContext }             from '../../agents/intent.agent';
+import type { LLMMessage }                        from '../types';
+import type { ActiveCaseContext, RecentMessage }  from '../../contracts/orchestration.contract';
+import type { ClarificationContext }              from '../../agents/intent.agent';
 
 const INTENT_TAXONOMY = `
 INFORMATIONAL INTENTS (intent_group = "informational"):
@@ -35,6 +35,82 @@ OUT-OF-SCOPE (intent_group = "out_of_scope"):
 - unsupported_request  (non-BFSI queries, code generation, general AI queries)
 `.trim();
 
+const DISAMBIGUATION_RULES = `
+CRITICAL DISAMBIGUATION RULES — read these before classifying:
+
+━━━ account_access_issue vs unauthorized_transaction ━━━
+
+account_access_issue:
+  Use when the CUSTOMER THEMSELVES cannot log in, is locked out, or has been
+  blocked from accessing their own account by a system or bank action.
+  The customer is the one who cannot get in.
+  → Keywords: "cannot log in", "locked out", "cannot access my account",
+    "account suspended", "account frozen", "forgot password", "login issue",
+    "otp not working", "authentication failed".
+  → Even if the customer mentions needing to pay or transfer something,
+    if the CORE PROBLEM is that THEY cannot log in → account_access_issue.
+  → Example: "I cannot log in to my online banking and I need to transfer money
+    for rent today" → account_access_issue (login problem, transfer mention
+    is only the reason they need access, not a separate complaint).
+
+unauthorized_transaction:
+  Use ONLY when a THIRD PARTY made transactions without the customer's permission.
+  The customer can or could access their account but found transactions they
+  did not make, or someone else is using their credentials/card.
+  → Keywords: "I did not authorize", "someone used my card", "unknown transaction",
+    "transaction I did not make", "someone transferred my money", "fraudulent charge".
+  → Example: "There are transactions I did not make on my account" → unauthorized_transaction.
+  → Example: "Someone withdrew money from my ATM without my permission" → unauthorized_transaction.
+
+RULE: "I cannot log in" alone → ALWAYS account_access_issue, never unauthorized_transaction.
+The presence of "I need to pay/transfer" after a login problem does NOT change the intent.
+
+━━━ account_restriction_issue vs account_access_issue ━━━
+
+account_restriction_issue:
+  The account exists and the customer may be able to log in, but specific
+  transactions or capabilities are blocked by the bank (KYC hold, compliance
+  flag, transaction limits, account on hold).
+  → Keywords: "account restricted", "account blocked", "account on hold",
+    "account flagged", "transactions blocked", "transaction limit reached",
+    "KYC required".
+
+account_access_issue:
+  The customer cannot log in at all or is completely locked out.
+  → If the customer can describe their account balance or recent activity,
+    they likely have access — lean toward account_restriction_issue.
+  → If they say "cannot log in", "locked out" → account_access_issue.
+
+━━━ refund_or_reversal_issue vs billing_or_fee_dispute ━━━
+
+refund_or_reversal_issue:
+  Customer is waiting for money to be returned (refund from merchant,
+  reversal of a wrong transfer they initiated).
+
+billing_or_fee_dispute:
+  Customer was charged incorrectly (double charge, wrong fee, unexpected
+  deduction). The charge already happened and they want it disputed.
+
+━━━ failed_or_delayed_transfer vs refund_or_reversal_issue ━━━
+
+failed_or_delayed_transfer:
+  An outbound transfer/payment the customer made has not arrived at the
+  destination or failed mid-process.
+
+refund_or_reversal_issue:
+  Money owed BACK to the customer has not been returned (merchant refund,
+  reversal of a bank error).
+
+━━━ When to use multi_issue_case ━━━
+
+Only when 2 or more CLEARLY DISTINCT operational issues are described.
+Do NOT split one narrative into multiple issues.
+Example of ONE issue: "I cannot log in and I need to transfer money for rent"
+  → single account_access_issue (the transfer is the reason, not a second issue).
+Example of TWO issues: "My card was stolen and there are unauthorized charges"
+  → multi_issue_case: lost_or_stolen_card + unauthorized_transaction.
+`.trim();
+
 const SYSTEM_PROMPT = `You are an intent classification engine for a BFSI (Banking, Financial Services, Insurance) customer support chatbot.
 
 Your ONLY job is to classify the customer message and return structured JSON.
@@ -42,6 +118,8 @@ Do NOT generate any other text. Return ONLY valid JSON.
 
 TAXONOMY:
 ${INTENT_TAXONOMY}
+
+${DISAMBIGUATION_RULES}
 
 OUTPUT FORMAT (return exactly this JSON structure, no other text):
 {
@@ -79,9 +157,9 @@ OUTPUT FORMAT (return exactly this JSON structure, no other text):
   "evidence": ["<short reason string>"]
 }
 
-RULES:
+CLASSIFICATION RULES:
 - confidence >= 0.85: clear intent
-- confidence 0.60-0.84: ask clarification (set flags.ambiguous = false, but caller will handle)
+- confidence 0.60-0.84: moderate confidence (caller will handle clarification)
 - confidence < 0.60: unclear (set intent_type = "unclear_issue", flags.ambiguous = true)
 - multi_issue = true: also set intent_type = "multi_issue_case" and populate issue_components with 2+ entries
 - hybrid = true: populate issue_components with one informational and one operational entry
@@ -98,7 +176,6 @@ export function buildIntentMessages(
 ): LLMMessage[] {
   const contextParts: string[] = [];
 
-  // Active case context
   if (activeCase) {
     contextParts.push(
       `ACTIVE CASE: intent="${activeCase.primary_intent_type}" stage="${activeCase.stage}" status="${activeCase.status}"`
@@ -107,7 +184,6 @@ export function buildIntentMessages(
     contextParts.push('ACTIVE CASE: none');
   }
 
-  // Recent conversation (last 4 messages only for brevity)
   const recent = recentMessages.slice(-4);
   if (recent.length > 0) {
     contextParts.push('RECENT MESSAGES:');
@@ -116,7 +192,6 @@ export function buildIntentMessages(
     });
   }
 
-  // Clarification context
   if (clarificationContext) {
     contextParts.push(
       `CLARIFICATION STATE: turn=${clarificationContext.turnCount} ` +
@@ -129,7 +204,7 @@ export function buildIntentMessages(
     '',
     `CUSTOMER MESSAGE: "${userMessage}"`,
     '',
-    'Classify the message and return JSON only.',
+    'Apply the disambiguation rules carefully, then classify and return JSON only.',
   ].join('\n');
 
   return [
