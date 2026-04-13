@@ -5,6 +5,7 @@
 
 import { Router, Request, Response } from 'express';
 import { authMiddleware }             from '../middleware/auth';
+import { serviceClient }              from '../config/supabase';
 import { resolveCustomer }            from '../services/customer.service';
 import { getOrCreateActiveSession }   from '../services/session.service';
 import { storeMessage }               from '../services/message.service';
@@ -22,6 +23,31 @@ router.post('/session', authMiddleware, async (req: Request, res: Response): Pro
       status:        session.session_status,
       currentCaseId: session.current_case_id,
       startedAt:     session.started_at,
+    });
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
+  }
+});
+
+// GET /api/chat/messages — returns message history for the active session
+router.get('/messages', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { authUserId, email } = req.user!;
+    const customer = await resolveCustomer(authUserId, email);
+    const session  = await getOrCreateActiveSession(customer.customer_id);
+
+    const { data, error } = await serviceClient
+      .from('messages')
+      .select('message_id, sender_type, message_text, response_mode, created_at')
+      .eq('session_id', session.session_id)
+      .order('created_at', { ascending: true })
+      .limit(50); // last 50 messages
+
+    if (error) throw { status: 500, message: 'Failed to load message history.' };
+
+    res.json({
+      sessionId: session.session_id,
+      messages:  data ?? [],
     });
   } catch (err: any) {
     res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
