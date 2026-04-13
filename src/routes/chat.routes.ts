@@ -11,6 +11,38 @@ import { getOrCreateActiveSession }   from '../services/session.service';
 import { storeMessage }               from '../services/message.service';
 import { processMessage }             from '../orchestrator/entry-route';
 
+interface TicketDetail {
+  ticket_id:   string;
+  issue_type:  string;
+  status:      string;
+  summary:     string;
+}
+
+async function fetchTicketDetails(
+  ticketIds: string[]
+): Promise<TicketDetail[]> {
+  if (!ticketIds || ticketIds.length === 0) return [];
+
+  const { data, error } = await serviceClient
+    .from('tickets')
+    .select(`
+      ticket_id,
+      issue_type,
+      status,
+      cases ( summary )
+    `)
+    .in('ticket_id', ticketIds);
+
+  if (error || !data) return [];
+
+  return data.map((row: any) => ({
+    ticket_id:  row.ticket_id,
+    issue_type: row.issue_type,
+    status:     row.status,
+    summary:    row.cases?.summary ?? '',
+  }));
+}
+
 const router = Router();
 
 router.post('/session', authMiddleware, async (req: Request, res: Response): Promise<void> => {
@@ -114,14 +146,23 @@ router.post('/message', authMiddleware, async (req: Request, res: Response): Pro
       result.message_id = assistantMessage.message_id;
     }
 
+    const allTicketIds = result.ticket_ids?.length
+      ? result.ticket_ids
+      : result.ticket_id
+        ? [result.ticket_id]
+        : [];
+
+    const ticketDetails = await fetchTicketDetails(allTicketIds);
+
     const responseBody: Record<string, unknown> = {
-      sessionId:    session_id,
-      messageId:    result.message_id,
-      reply:        result.assistant_text,
-      responseMode: result.response_mode,
-      caseId:       result.case_id   ?? null,
-      ticketId:     result.ticket_id ?? null,
-      ticketIds: result.ticket_ids ?? [],
+      sessionId:     session_id,
+      messageId:     result.message_id,
+      reply:         result.assistant_text,
+      responseMode:  result.response_mode,
+      caseId:        result.case_id   ?? null,
+      ticketId:      result.ticket_id ?? null,
+      ticketIds:     result.ticket_ids ?? [],
+      tickets:       ticketDetails,
     };
 
     if (process.env.NODE_ENV !== 'production' && result.debug) {
