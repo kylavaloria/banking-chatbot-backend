@@ -7,7 +7,7 @@
 import type { LLMMessage }  from '../types';
 import type { ResponseInput } from '../../contracts/response.contract';
 
-const SYSTEM_PROMPT = `You are a customer-facing response writer for a BFSI (Banking, Financial Services, Insurance) customer support chatbot.
+const BASE_SYSTEM_PROMPT = `You are a customer-facing response writer for a BFSI (Banking, Financial Services, Insurance) customer support chatbot.
 
 You will receive a structured brief describing what happened and what to communicate.
 Your job is to write a clear, empathetic, professional response to the customer.
@@ -26,6 +26,21 @@ STRICT RULES:
 11. Do not use bullet points unless the brief explicitly lists multiple actions
 12. Write in plain text — no markdown, no headers`;
 
+const EMOTION_INSTRUCTIONS: Record<string, string> = {
+  angry:      'The customer is angry. Lead with a sincere apology. Acknowledge their frustration directly. Do not be defensive or dismissive. Use calming, respectful language.',
+  frustrated: 'The customer is frustrated, likely from repeated attempts or long waits. Validate their experience. Show empathy for the time they have spent. Avoid generic responses.',
+  anxious:    'The customer is anxious or worried. Be reassuring and calming. Emphasize that their concern is being handled and they are not alone. Provide clear next steps.',
+  distressed: 'The customer is in distress and may be facing a personal hardship. Be compassionate and warm. Prioritize empathy over process. Show genuine care.',
+  confused:   'The customer is confused. Use clear, simple language. Avoid jargon. Confirm understanding step by step.',
+  satisfied:  'The customer is satisfied. Keep the response warm and friendly. Reinforce that their concern is handled.',
+  neutral:    '',
+};
+
+function buildSystemPrompt(emotionLabel?: string): string {
+  const instruction = emotionLabel ? (EMOTION_INSTRUCTIONS[emotionLabel] ?? '') : '';
+  return instruction ? `${instruction}\n\n${BASE_SYSTEM_PROMPT}` : BASE_SYSTEM_PROMPT;
+}
+
 export function buildResponseMessages(
   input: ResponseInput,
   extra: {
@@ -33,6 +48,7 @@ export function buildResponseMessages(
     topicSwitched?:             boolean;
     ticketCount?:               number;
     cardBlockOutcome?:          'confirmed' | 'declined' | null;
+    emotionLabel?:              string;
   }
 ): LLMMessage[] {
   const brief: string[] = [
@@ -83,7 +99,7 @@ export function buildResponseMessages(
   const userContent = brief.join('\n') + '\n\nWrite the customer response now (plain text only, no markdown):';
 
   return [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: buildSystemPrompt(extra.emotionLabel) },
     { role: 'user',   content: userContent },
   ];
 }

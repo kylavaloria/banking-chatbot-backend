@@ -4,6 +4,7 @@
 
 import type { PipelineContext, OrchestratorResult } from '../contracts/orchestration.contract';
 import type { ClarificationContext }                from '../agents/intent.agent';
+import type { EmotionResult }                       from '../contracts/emotion.contract';
 
 import { triageIntentAsync }   from '../agents/triage.agent';
 import { decide }              from '../agents/policy.agent';
@@ -11,6 +12,12 @@ import { executeAction }       from '../agents/action.agent';
 import { generateResponse }    from '../agents/response.agent';
 import { answerInformational } from '../rag/index';
 import { env }                 from '../config/env';
+
+function emotionIntensityLevel(e: EmotionResult): 'low' | 'medium' | 'high' {
+  if (e.intensity >= 0.7) return 'high';
+  if (e.intensity >= 0.4) return 'medium';
+  return 'low';
+}
 
 export async function runConversationManager(
   ctx: PipelineContext,
@@ -77,7 +84,7 @@ export async function runConversationManager(
       flags: { ...intent_result.flags, hybrid: false },
     };
 
-    const triageResult  = await triageIntentAsync(syntheticIntent, ctx.user_message ?? '');
+    const triageResult  = await triageIntentAsync(syntheticIntent, ctx.user_message ?? '', ctx.emotion_result);
     ctx.triage_result   = triageResult;
 
     const policyOutput  = decide(syntheticIntent, triageResult);
@@ -92,6 +99,7 @@ export async function runConversationManager(
     const assistantText = await generateResponse({
       actionResult, intentResult: syntheticIntent, triageResult, policyOutput,
       clarificationContext, hybridInformationalAnswer,
+      emotionLabel: ctx.emotion_result?.label,
     });
     ctx.assistant_text = assistantText;
 
@@ -99,6 +107,8 @@ export async function runConversationManager(
       assistant_text: assistantText, response_mode: actionResult.response_mode,
       session_id: conversation.session_id, message_id: '',
       case_id: actionResult.case_id ?? null, ticket_id: actionResult.ticket_id ?? null,
+      emotion_label:     ctx.emotion_result?.label,
+      emotion_intensity: ctx.emotion_result ? emotionIntensityLevel(ctx.emotion_result) : undefined,
     };
     if (process.env.NODE_ENV !== 'production') {
       result.debug = {
@@ -113,7 +123,7 @@ export async function runConversationManager(
 
   let triageResult = ctx.triage_result;
   if (intent_result.intent_group === 'operational') {
-    triageResult      = await triageIntentAsync(intent_result, ctx.user_message ?? '');
+    triageResult      = await triageIntentAsync(intent_result, ctx.user_message ?? '', ctx.emotion_result);
     ctx.triage_result = triageResult;
   }
 
@@ -161,6 +171,7 @@ export async function runConversationManager(
     policyOutput,
     clarificationContext,
     topicSwitched,
+    emotionLabel: ctx.emotion_result?.label,
   });
   ctx.assistant_text = assistantText;
 
@@ -173,7 +184,9 @@ export async function runConversationManager(
     ticket_id:      enrichedActionResult.ticket_id ?? null,
     ticket_ids:     enrichedActionResult.created_ticket_ids?.length
       ? enrichedActionResult.created_ticket_ids : undefined,
-    topic_switched: topicSwitched || undefined,
+    topic_switched:    topicSwitched || undefined,
+    emotion_label:     ctx.emotion_result?.label,
+    emotion_intensity: ctx.emotion_result ? emotionIntensityLevel(ctx.emotion_result) : undefined,
   };
 
   if (process.env.NODE_ENV !== 'production') {

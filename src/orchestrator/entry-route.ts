@@ -8,6 +8,7 @@
 
 import { serviceClient }                from '../config/supabase';
 import { classifyIntent }               from '../agents/intent.agent';
+import { detectEmotion }               from '../agents/emotion.agent';
 import { executeCardBlockConfirmation } from '../agents/action.agent';
 import { generateResponse }             from '../agents/response.agent';
 import { runConversationManager }       from './conversation-manager';
@@ -344,19 +345,29 @@ export async function processMessage(
   // ── Step 4: Derive clarification context from history ─────────────────────
   const clarificationContext = deriveClarificationContext(recent_messages);
 
-  // ── Step 5: Intent Agent ──────────────────────────────────────────────────
-  const intentResult = await classifyIntent({
-    userMessage,
-    recentMessages: recent_messages,
-    activeCase,
-    clarificationContext,
-  });
+  // ── Step 5: Intent + Emotion Agents (parallel) ────────────────────────────
+  const [intentResult, emotionResult] = await Promise.all([
+    classifyIntent({
+      userMessage,
+      recentMessages: recent_messages,
+      activeCase,
+      clarificationContext,
+    }),
+    detectEmotion(userMessage).catch(() => ({
+      label:      'neutral' as const,
+      intensity:  0,
+      confidence: 0,
+      source:     'fallback' as const,
+      evidence:   ['[emotion] Detection failed'],
+    })),
+  ]);
 
   // ── Step 6: Build pipeline context and run Conversation Manager ───────────
   const pipelineCtx: PipelineContext = {
     conversation,
-    user_message:  userMessage,
-    intent_result: intentResult,
+    user_message:   userMessage,
+    intent_result:  intentResult,
+    emotion_result: emotionResult,
   };
 
   return runConversationManager(pipelineCtx, clarificationContext);

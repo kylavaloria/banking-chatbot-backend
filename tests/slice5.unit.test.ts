@@ -11,6 +11,7 @@ import fs   from 'fs';
 vi.stubEnv('NODE_ENV',                   'test');
 vi.stubEnv('MISTRAL_API_KEY',            'test-key');
 vi.stubEnv('GROQ_API_KEY',               'test-key');
+vi.stubEnv('GOOGLE_AI_STUDIO_API_KEY',   'test-key');
 vi.stubEnv('SUPABASE_URL',               'https://fake.supabase.co');
 vi.stubEnv('SUPABASE_ANON_KEY',          'fake-anon');
 vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY',  'fake-service');
@@ -19,16 +20,15 @@ vi.stubEnv('KB_DOCS_PATH',              'docs/kb');
 vi.stubEnv('RAG_TOP_K',                  '3');
 vi.stubEnv('RAG_SIMILARITY_THRESHOLD',   '0.5');
 vi.stubEnv('EMBEDDING_MODEL',            'mistral-embed');
-vi.stubEnv('RAG_GENERATION_MODEL',       'llama-3.1-8b-instant');
+vi.stubEnv('RAG_GENERATION_MODEL',       'gemini-2.5-flash-lite-preview-06-17');
 
-// One shared mock — multiple vi.mock factories for the same module get hoisted
-// and the last one wins, breaking the "success" test. Configure per test instead.
-const { mockCallGroq } = vi.hoisted(() => ({
-  mockCallGroq: vi.fn(),
+// Hoist the Gemini mock so it is available before module imports
+const { mockCallGemini } = vi.hoisted(() => ({
+  mockCallGemini: vi.fn(),
 }));
 
-vi.mock('../src/llm/groq.client', () => ({
-  callGroq: mockCallGroq,
+vi.mock('../src/llm/gemini.client', () => ({
+  callGemini: mockCallGemini,
 }));
 
 // ---------------------------------------------------------------------------
@@ -89,7 +89,6 @@ describe('RAG vector store', () => {
     const results = store.searchChunks(queryEmbed, 3, 0.0);
 
     expect(results.length).toBeGreaterThan(0);
-    // The most similar chunk should be about savings
     expect(results[0].text).toContain('savings');
   });
 
@@ -129,7 +128,7 @@ describe('cosineSimilarity', () => {
 });
 
 // ---------------------------------------------------------------------------
-// JSON extraction (re-used from Slice 4 — verify still works)
+// JSON extraction
 // ---------------------------------------------------------------------------
 
 describe('extractJSON', () => {
@@ -140,12 +139,12 @@ describe('extractJSON', () => {
 });
 
 // ---------------------------------------------------------------------------
-// RAG generator — stub the Groq call
+// RAG generator — stub the Gemini call
 // ---------------------------------------------------------------------------
 
 describe('RAG generator', () => {
   beforeEach(() => {
-    mockCallGroq.mockReset();
+    mockCallGemini.mockReset();
   });
 
   it('returns a fallback answer when no chunks are provided', async () => {
@@ -154,38 +153,46 @@ describe('RAG generator', () => {
     expect(result.is_fallback).toBe(true);
     expect(result.source_mode).toBe('placeholder');
     expect(result.answer_text.length).toBeGreaterThan(10);
-    expect(mockCallGroq).not.toHaveBeenCalled();
+    expect(mockCallGemini).not.toHaveBeenCalled();
   });
 
-  it('calls Groq and returns a grounded answer when chunks are provided', async () => {
-    mockCallGroq.mockResolvedValue({
+  it('calls Gemini and returns a grounded answer when chunks are provided', async () => {
+    mockCallGemini.mockResolvedValue({
       text:       'Our branches are open Monday to Friday from 9am to 5pm.',
-      model_used: 'llama-3.1-8b-instant',
+      model_used: 'gemini-2.5-flash-lite-preview-06-17',
       usage:      { prompt_tokens: 50, completion_tokens: 20 },
     });
 
     const { generateRAGAnswer } = await import('../src/rag/generator');
     const fakeChunks = [{
-      chunk_id: 'branch__0', doc_id: 'branch', title: 'Branch Hours',
-      category: 'branch_or_service_info', text: 'Open Monday to Friday 9am to 5pm.',
-      chunk_index: 0, similarity: 0.88,
+      chunk_id:    'branch__0',
+      doc_id:      'branch',
+      title:       'Branch Hours',
+      category:    'branch_or_service_info',
+      text:        'Open Monday to Friday 9am to 5pm.',
+      chunk_index: 0,
+      similarity:  0.88,
     }];
 
     const result = await generateRAGAnswer('What are your branch hours?', fakeChunks);
     expect(result.source_mode).toBe('rag');
     expect(result.is_fallback).toBe(false);
     expect(result.answer_text).toContain('9am');
-    expect(mockCallGroq).toHaveBeenCalledTimes(1);
+    expect(mockCallGemini).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back gracefully when Groq throws', async () => {
-    mockCallGroq.mockRejectedValue(new Error('Network error'));
+  it('falls back gracefully when Gemini throws', async () => {
+    mockCallGemini.mockRejectedValue(new Error('Network error'));
 
     const { generateRAGAnswer } = await import('../src/rag/generator');
     const fakeChunks = [{
-      chunk_id: 'branch__0', doc_id: 'branch', title: 'Branch Hours',
-      category: 'branch_or_service_info', text: 'Open Monday to Friday.',
-      chunk_index: 0, similarity: 0.88,
+      chunk_id:    'branch__0',
+      doc_id:      'branch',
+      title:       'Branch Hours',
+      category:    'branch_or_service_info',
+      text:        'Open Monday to Friday.',
+      chunk_index: 0,
+      similarity:  0.88,
     }];
 
     const result = await generateRAGAnswer('What are your hours?', fakeChunks);
