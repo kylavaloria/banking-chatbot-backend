@@ -12,4 +12,6 @@ export interface TicketView {
   customer_email:     string;
   customer_mobile:    string | null;
   customer_segment:   string | null;
+  emotion_label?:     string | null;
+  emotion_intensity?: string | null;
 }
