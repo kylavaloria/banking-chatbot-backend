@@ -23,6 +23,7 @@ export interface ResponseAgentInput {
   cardBlockOutcome?:         'confirmed' | 'declined' | null;
   hybridInformationalAnswer?:string | null;
   topicSwitched?:            boolean;
+  emotionLabel?:             string;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +272,7 @@ async function generateWithMistral(
     hybridAnswer?:     string | null;
     topicSwitched?:    boolean;
     ticketCount?:      number;
+    emotionLabel?:     string;
   }
 ): Promise<string | null> {
   try {
@@ -279,6 +281,7 @@ async function generateWithMistral(
       topicSwitched:             extra.topicSwitched,
       ticketCount:               extra.ticketCount,
       cardBlockOutcome:          extra.cardBlockOutcome,
+      emotionLabel:              extra.emotionLabel,
     });
 
     const llmResponse = await callMistral({
@@ -315,6 +318,7 @@ export async function generateResponse(input: ResponseAgentInput): Promise<strin
     topicSwitched:    input.topicSwitched ?? false,
     actionResult:     input.actionResult,
     ticketCount:      input.actionResult.created_ticket_ids?.length,
+    emotionLabel:     input.emotionLabel,
   };
 
   if (env.NODE_ENV === 'test') {

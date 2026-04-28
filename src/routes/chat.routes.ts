@@ -103,8 +103,8 @@ router.post('/message', authMiddleware, async (req: Request, res: Response): Pro
     const { customer_id } = customer;
     const { session_id }  = session;
 
-    // Persist user message before orchestration
-    await storeMessage({
+    // Persist user message before orchestration (emotion columns updated after pipeline)
+    const userMessage = await storeMessage({
       sessionId:   session_id,
       caseId:      session.current_case_id ?? null,
       senderType:  'user',
@@ -131,6 +131,20 @@ router.post('/message', authMiddleware, async (req: Request, res: Response): Pro
     };
 
     const result = await processMessage(customer_id, session_id, trimmedMessage, persistFn);
+
+    // Update user message row with emotion data if available
+    if (result.emotion_label) {
+      await serviceClient
+        .from('messages')
+        .update({
+          emotion_label:     result.emotion_label,
+          emotion_intensity: result.emotion_intensity ?? null,
+        })
+        .eq('message_id', userMessage.message_id)
+        .then(({ error }) => {
+          if (error) console.warn('[chat.routes] Failed to update emotion on user message:', error.message);
+        });
+    }
 
     // Persist assistant reply for non-card-block branches
     // (card-block branch persists its own reply inside entry-route via persistFn)

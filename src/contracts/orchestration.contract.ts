@@ -7,6 +7,7 @@ import type { IntentResult }    from './intent.contract';
 import type { TriageResult }    from './triage.contract';
 import type { PolicyDecision }  from './policy.contract';
 import type { ActionResult, ResponseMode } from './action.contract';
+import type { EmotionResult }   from './emotion.contract';
 
 export interface ActiveCaseContext {
   case_id:             string;
@@ -38,6 +39,7 @@ export interface PipelineContext {
   policy_decision?: PolicyDecision;
   action_result?:  ActionResult;
   assistant_text?: string;
+  emotion_result?: EmotionResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +70,9 @@ export interface OrchestratorResult {
   hybrid_result?: HybridResult;
   /** True when a topic switch caused a new case to be created */
   topic_switched?: boolean;
+  /** Emotion detected from the user message — stored on the user message row */
+  emotion_label?:     string;
+  emotion_intensity?: string;
   debug?: {
     intent_result?:   IntentResult;
     triage_result?:   TriageResult;

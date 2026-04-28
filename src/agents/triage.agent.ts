@@ -30,7 +30,9 @@ import type {
   TriageSignals, TriageResult, Importance, Urgency,
   Priority, RecommendedPath, TriageOverrideReason,
 } from '../contracts/triage.contract';
+import type { EmotionResult }   from '../contracts/emotion.contract';
 
+import { EMOTION_TRIAGE_INTENSITY_THRESHOLD } from '../contracts/emotion.contract';
 import { callGemini }           from '../llm/gemini.client';
 import { extractJSON }          from '../utils/json-extract';
 import { buildTriageMessages }  from '../llm/prompts/triage.prompt';
@@ -317,18 +319,45 @@ function applyOverrides(
 }
 
 // ---------------------------------------------------------------------------
+// Emotion soft-signal
+//
+// Only anxious emotion at high intensity qualifies for a one-step urgency
+// upgrade (low → medium). No other emotion label changes urgency. This is a
+// soft signal: it cannot push urgency above medium and it never overrides the
+// deterministic fraud / compromise P1 overrides.
+// ---------------------------------------------------------------------------
+
+function applyEmotionSoftSignal(
+  urgency:       Urgency,
+  emotionResult: EmotionResult | undefined,
+  evidence:      string[]
+): Urgency {
+  if (!emotionResult) return urgency;
+  if (emotionResult.label !== 'anxious') return urgency;
+  if (emotionResult.intensity < EMOTION_TRIAGE_INTENSITY_THRESHOLD) return urgency;
+  if (urgency !== 'low') return urgency;
+
+  evidence.push('[emotion] high-distress emotion signal: upgraded urgency low → medium');
+  return 'medium';
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 // Synchronous triage — rule-based only, used in tests and sync contexts
-export function triageIntent(intentResult: IntentResult): TriageResult {
+export function triageIntent(
+  intentResult:  IntentResult,
+  emotionResult?: EmotionResult
+): TriageResult {
   const intentType = intentResult.intent_type as OperationalIntentType;
   const evidence: string[] = [`[sync] Triaging: ${intentType}`];
 
   const signals    = extractSignalsRuleBased(intentResult, evidence);
   const importance = computeImportance(signals, intentType, evidence);
-  const urgency    = computeUrgency(signals, intentType, evidence);
-  const matrix     = PRIORITY_MATRIX[importance][urgency];
+  const baseUrgency = computeUrgency(signals, intentType, evidence);
+  const urgency     = applyEmotionSoftSignal(baseUrgency, emotionResult, evidence);
+  const matrix      = PRIORITY_MATRIX[importance][urgency];
   const { priority, overrideReason } = applyOverrides(matrix, signals, evidence);
 
   return {
@@ -343,8 +372,9 @@ export function triageIntent(intentResult: IntentResult): TriageResult {
 
 // Async triage — LLM signal extraction + deterministic matrix
 export async function triageIntentAsync(
-  intentResult: IntentResult,
-  userMessage:  string
+  intentResult:  IntentResult,
+  userMessage:   string,
+  emotionResult?: EmotionResult
 ): Promise<TriageResult> {
   const intentType = intentResult.intent_type as OperationalIntentType;
   const evidence: string[] = [`Triaging: ${intentType}`];
@@ -365,9 +395,10 @@ export async function triageIntentAsync(
     signals = extractSignalsRuleBased(intentResult, evidence);
   }
 
-  const importance = computeImportance(signals, intentType, evidence);
-  const urgency    = computeUrgency(signals, intentType, evidence);
-  const matrix     = PRIORITY_MATRIX[importance][urgency];
+  const importance  = computeImportance(signals, intentType, evidence);
+  const baseUrgency = computeUrgency(signals, intentType, evidence);
+  const urgency     = applyEmotionSoftSignal(baseUrgency, emotionResult, evidence);
+  const matrix      = PRIORITY_MATRIX[importance][urgency];
   const { priority, overrideReason } = applyOverrides(matrix, signals, evidence);
 
   return {
