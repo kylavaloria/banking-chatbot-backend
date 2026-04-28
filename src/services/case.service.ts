@@ -121,3 +121,32 @@ export async function updateCaseStage(
     throw { status: 500, message: 'Failed to update case stage.' };
   }
 }
+
+/**
+ * Updates the summary of an existing case when a customer sends a follow-up
+ * message. Does not change priority, status, or any other fields.
+ * Never throws — failures are logged only.
+ */
+export async function updateCaseSummary(
+  caseId: string,
+  newSummary: string
+): Promise<void> {
+  try {
+    const { error } = await serviceClient
+      .from('cases')
+      .update({
+        summary: newSummary,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('case_id', caseId);
+
+    if (error) {
+      console.warn('[CaseService] Failed to update case summary:', error.message);
+    }
+  } catch (err) {
+    console.warn(
+      '[CaseService] Failed to update case summary:',
+      err instanceof Error ? err.message : err
+    );
+  }
+}

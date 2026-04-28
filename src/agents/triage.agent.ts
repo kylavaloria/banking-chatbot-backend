@@ -33,7 +33,7 @@ import type {
 import type { EmotionResult }   from '../contracts/emotion.contract';
 
 import { EMOTION_TRIAGE_INTENSITY_THRESHOLD } from '../contracts/emotion.contract';
-import { callGemini }           from '../llm/gemini.client';
+import { callWithFallback }   from '../llm/model-router';
 import { extractJSON }          from '../utils/json-extract';
 import { buildTriageMessages }  from '../llm/prompts/triage.prompt';
 import { env }                  from '../config/env';
@@ -170,11 +170,13 @@ async function extractSignalsLLM(
   try {
     const messages = buildTriageMessages(userMessage, intentResult);
 
-    const llmResponse = await callGemini({
+    const llmResponse = await callWithFallback({
       messages,
-      model:       env.TRIAGE_MODEL,
-      temperature: 0.1,
-      maxTokens:   1024,
+      primaryModel:  env.PRIMARY_TRIAGE_MODEL,
+      fallbackModel: env.FALLBACK_TRIAGE_MODEL,
+      temperature:   0.1,
+      maxTokens:     1024,
+      agentName:     'TriageAgent',
     });
 
     const parsed = extractJSON(llmResponse.text);

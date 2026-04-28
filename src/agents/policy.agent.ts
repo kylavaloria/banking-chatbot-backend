@@ -20,6 +20,7 @@ function resolveTone(responseMode: ResponseMode): ToneProfile {
     case 'ticket_confirmation':         return 'reassuring';
     case 'critical_action_confirmation':return 'urgent_but_calm';
     case 'multi_issue_confirmation':    return 'structured_reassuring';
+    case 'follow_up_update':            return 'reassuring';
     case 'refusal':                     return 'neutral';
   }
 }

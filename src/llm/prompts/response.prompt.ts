@@ -6,6 +6,7 @@
 
 import type { LLMMessage }  from '../types';
 import type { ResponseInput } from '../../contracts/response.contract';
+import type { EmotionResult } from '../../contracts/emotion.contract';
 
 const BASE_SYSTEM_PROMPT = `You are a customer-facing response writer for a BFSI (Banking, Financial Services, Insurance) customer support chatbot.
 
@@ -36,9 +37,41 @@ const EMOTION_INSTRUCTIONS: Record<string, string> = {
   neutral:    '',
 };
 
-function buildSystemPrompt(emotionLabel?: string): string {
-  const instruction = emotionLabel ? (EMOTION_INSTRUCTIONS[emotionLabel] ?? '') : '';
-  return instruction ? `${instruction}\n\n${BASE_SYSTEM_PROMPT}` : BASE_SYSTEM_PROMPT;
+const FOLLOW_UP_INSTRUCTION = `
+CONTEXT: The customer already has an OPEN support case being actively reviewed.
+They are sending a follow-up — an update, a question, or an emotional reaction.
+
+DO NOT say:
+- "We have opened a case" or "A ticket has been created"
+- "We have noted your message regarding..."
+- "Thank you for your update" as an opener
+
+INSTEAD, respond naturally and empathetically:
+- Acknowledge what they just said specifically
+- If they are angry ("This is unacceptable"), validate their frustration
+  with a sincere apology and affirm that it is being treated as urgent
+- If they are asking a question ("Why is this happening?"), explain briefly
+  that the team is investigating and will provide answers
+- If they are worried, reassure them directly
+- Keep it to 2-3 sentences maximum
+- Sound like a real human agent, not a system
+
+For high-priority (fraud/unauthorized) cases specifically:
+- Emphasize urgency and that a dedicated team is already on it
+- Do not minimize their concern
+- If they express anger, lead with a sincere apology before reassuring
+`.trim();
+
+function buildEmotionInstruction(emotionLabel?: string | null): string {
+  if (!emotionLabel) return '';
+  return EMOTION_INSTRUCTIONS[emotionLabel] ?? '';
+}
+
+function buildSystemPrompt(emotionLabel?: string | null, isFollowUp?: boolean): string {
+  const followUpBlock = isFollowUp ? FOLLOW_UP_INSTRUCTION : '';
+  const emotionBlock  = buildEmotionInstruction(emotionLabel);
+  const basePrompt      = BASE_SYSTEM_PROMPT;
+  return [followUpBlock, emotionBlock, basePrompt].filter(Boolean).join('\n\n');
 }
 
 export function buildResponseMessages(
@@ -49,13 +82,32 @@ export function buildResponseMessages(
     ticketCount?:               number;
     cardBlockOutcome?:          'confirmed' | 'declined' | null;
     emotionLabel?:              string;
+    isFollowUp?:                boolean;
+    followUpUserMessage?:       string | null;
+    followUpEmotionResult?:     EmotionResult | null;
   }
 ): LLMMessage[] {
-  const brief: string[] = [
+  const brief: string[] = [];
+
+  if (extra.isFollowUp === true && extra.followUpUserMessage) {
+    brief.push(
+      `CUSTOMER'S LATEST MESSAGE (respond to this directly; do not echo internal summaries verbatim):\n` +
+      `"${extra.followUpUserMessage.slice(0, 500)}"`
+    );
+  }
+
+  if (extra.isFollowUp === true && extra.followUpEmotionResult && extra.followUpEmotionResult.label !== 'neutral') {
+    brief.push(
+      `CUSTOMER EMOTION (soft signal): ${extra.followUpEmotionResult.label}, ` +
+      `intensity ${extra.followUpEmotionResult.intensity.toFixed(2)}`
+    );
+  }
+
+  brief.push(
     `RESPONSE MODE: ${input.response_mode}`,
     `TONE: ${input.tone_profile}`,
     `INTENT SUMMARY: ${input.intent_summary}`,
-  ];
+  );
 
   if (input.actions_taken.length > 0) {
     brief.push(`ACTIONS TAKEN:\n${input.actions_taken.map(a => `  - ${a}`).join('\n')}`);
@@ -99,7 +151,10 @@ export function buildResponseMessages(
   const userContent = brief.join('\n') + '\n\nWrite the customer response now (plain text only, no markdown):';
 
   return [
-    { role: 'system', content: buildSystemPrompt(extra.emotionLabel) },
-    { role: 'user',   content: userContent },
+    {
+      role:    'system',
+      content: buildSystemPrompt(extra.emotionLabel ?? null, extra.isFollowUp === true),
+    },
+    { role: 'user', content: userContent },
   ];
 }
