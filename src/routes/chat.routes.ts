@@ -132,6 +132,18 @@ router.post('/message', authMiddleware, async (req: Request, res: Response): Pro
 
     const result = await processMessage(customer_id, session_id, trimmedMessage, persistFn);
 
+    // Backfill case_id on the user message when it was stored before the case existed
+    // (first message of a new case has case_id = null at insert time).
+    if (!session.current_case_id && result.case_id) {
+      await serviceClient
+        .from('messages')
+        .update({ case_id: result.case_id })
+        .eq('message_id', userMessage.message_id)
+        .then(({ error }) => {
+          if (error) console.warn('[chat.routes] Failed to backfill case_id on user message:', error.message);
+        });
+    }
+
     // Update user message row with emotion data if available
     if (result.emotion_label) {
       await serviceClient
