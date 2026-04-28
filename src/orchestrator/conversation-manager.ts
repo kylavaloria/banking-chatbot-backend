@@ -2,16 +2,41 @@
 // Conversation Manager — Slice 5: RAG for informational branch
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { PipelineContext, OrchestratorResult } from '../contracts/orchestration.contract';
+import type { PipelineContext, OrchestratorResult, ActiveCaseContext } from '../contracts/orchestration.contract';
 import type { ClarificationContext }                from '../agents/intent.agent';
 import type { EmotionResult }                       from '../contracts/emotion.contract';
+import type { IntentResult }                        from '../contracts/intent.contract';
+import type { ActionResult, CaseStage }             from '../contracts/action.contract';
 
 import { triageIntentAsync }   from '../agents/triage.agent';
 import { decide }              from '../agents/policy.agent';
 import { executeAction }       from '../agents/action.agent';
-import { generateResponse }    from '../agents/response.agent';
+import { generateResponse, FOLLOW_UP_ASSISTANT_FALLBACK } from '../agents/response.agent';
 import { answerInformational } from '../rag/index';
+import { updateCaseSummary }   from '../services/case.service';
 import { env }                 from '../config/env';
+
+function buildFollowUpSummary(
+  activeCase: ActiveCaseContext,
+  intentResult: IntentResult,
+  userMessage: string
+): string {
+  const existing = activeCase.summary ?? '';
+  const truncatedMessage = userMessage.slice(0, 200);
+
+  if (intentResult.intent_type === 'complaint_follow_up') {
+    return `${existing} Customer followed up: "${truncatedMessage}"`;
+  }
+
+  if (
+    intentResult.intent_type === 'unclear_issue' ||
+    intentResult.intent_type === 'general_complaint'
+  ) {
+    return `${existing} Customer expressed continued concern: "${truncatedMessage}"`;
+  }
+
+  return `${existing} Updated: ${truncatedMessage}`;
+}
 
 function emotionIntensityLevel(e: EmotionResult): 'low' | 'medium' | 'high' {
   if (e.intensity >= 0.7) return 'high';
@@ -129,6 +154,88 @@ export async function runConversationManager(
 
   const policyOutput  = decide(intent_result, triageResult);
   ctx.policy_decision = policyOutput.decision;
+
+  const activeCase = conversation.active_case;
+  const isFollowUpCase =
+    intent_result.consistency_with_active_case === 'same_case' &&
+    activeCase !== null &&
+    activeCase.status !== 'resolved' &&
+    activeCase.status !== 'closed' &&
+    activeCase.stage !== 'awaiting_card_block_confirmation' &&
+    !intent_result.flags.multi_issue &&
+    intent_result.intent_group === 'operational' &&
+    !intent_result.flags.malicious_input;
+
+  if (isFollowUpCase && activeCase) {
+    const updatedSummary = buildFollowUpSummary(
+      activeCase,
+      intent_result,
+      ctx.user_message ?? ''
+    );
+    await updateCaseSummary(activeCase.case_id, updatedSummary);
+
+    const followUpActionResult: ActionResult = {
+      response_mode:          'follow_up_update',
+      case_id:                activeCase.case_id,
+      ticket_id:              null,
+      created_ticket_ids:     [],
+      stage_after_action:     activeCase.stage as CaseStage,
+      informational_payload:  null,
+      clarification_payload:  null,
+      refusal_payload:        null,
+      execution_summary:      ['follow_up_case_summary_update'],
+    };
+    ctx.action_result = followUpActionResult;
+
+    let assistantText: string;
+    try {
+      assistantText = await generateResponse({
+        actionResult:         followUpActionResult,
+        intentResult:         intent_result,
+        triageResult,
+        policyOutput,
+        clarificationContext,
+        isFollowUp:           true,
+        topicSwitched:        false,
+        emotionLabel:         ctx.emotion_result?.label,
+        emotionResult:        ctx.emotion_result ?? null,
+        userMessage:          ctx.user_message ?? '',
+        activeCase:           activeCase,
+      });
+    } catch (err) {
+      console.warn(
+        '[ConversationManager] generateResponse failed in follow-up branch',
+        err instanceof Error ? err.message : err
+      );
+      assistantText = FOLLOW_UP_ASSISTANT_FALLBACK;
+    }
+    const trimmed = assistantText.trim();
+    assistantText = trimmed.length > 0 ? trimmed : FOLLOW_UP_ASSISTANT_FALLBACK;
+
+    ctx.assistant_text = assistantText;
+
+    const followUpResult: OrchestratorResult = {
+      assistant_text:    assistantText,
+      response_mode:     'follow_up_update',
+      session_id:        conversation.session_id,
+      message_id:        '',
+      case_id:           activeCase.case_id,
+      ticket_id:         null,
+      emotion_label:     ctx.emotion_result?.label,
+      emotion_intensity: ctx.emotion_result
+        ? emotionIntensityLevel(ctx.emotion_result)
+        : undefined,
+    };
+    if (process.env.NODE_ENV !== 'production') {
+      followUpResult.debug = {
+        intent_result,
+        triage_result:   triageResult,
+        policy_decision: policyOutput.decision,
+        action_result:   followUpActionResult,
+      };
+    }
+    return followUpResult;
+  }
 
   const actionResult = await executeAction({
     context: conversation, intentResult: intent_result,

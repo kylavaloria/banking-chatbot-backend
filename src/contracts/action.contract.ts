@@ -17,6 +17,7 @@ export type ResponseMode =
   | 'ticket_confirmation'         // Standard ticket created (P3/P2)
   | 'critical_action_confirmation'// P1 with live escalation and/or card block
   | 'multi_issue_confirmation'    // Multi-issue split completed
+  | 'follow_up_update'            // Same-case follow-up; case summary updated, no new ticket
   | 'refusal';                    // Out-of-scope, malicious, or unsafe request
 
 // ---------------------------------------------------------------------------

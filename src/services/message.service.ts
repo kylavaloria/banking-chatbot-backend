@@ -9,6 +9,7 @@ export type ResponseMode =
   | 'ticket_confirmation'
   | 'critical_action_confirmation'
   | 'multi_issue_confirmation'
+  | 'follow_up_update'
   | 'refusal';
 
 export interface StoreMessageParams {
@@ -31,11 +32,23 @@ export interface MessageRecord {
   created_at: string;
 }
 
+function isLikelyResponseModeRejectedByDb(error: { message?: string; code?: string } | null): boolean {
+  if (!error) return false;
+  const m = (error.message ?? '').toLowerCase();
+  return (
+    error.code === '22P02' ||
+    m.includes('invalid input value for enum') ||
+    m.includes('violates check constraint') ||
+    m.includes('check constraint')
+  );
+}
+
 export async function storeMessage(
   params: StoreMessageParams
 ): Promise<MessageRecord> {
-  const newMessage = {
-    message_id: uuidv4(),
+  const message_id = uuidv4();
+  const row = {
+    message_id,
     session_id: params.sessionId,
     case_id: params.caseId ?? null,
     ticket_id: params.ticketId ?? null,
@@ -45,13 +58,35 @@ export async function storeMessage(
     created_at: new Date().toISOString(),
   };
 
-  const { data, error } = await serviceClient
+  let { data, error } = await serviceClient
     .from('messages')
-    .insert(newMessage)
+    .insert(row)
     .select()
     .single();
 
+  if (
+    error &&
+    params.responseMode === 'follow_up_update' &&
+    isLikelyResponseModeRejectedByDb(error)
+  ) {
+    console.warn(
+      '[storeMessage] DB rejected response_mode=follow_up_update (extend enum: scripts/migrations/2026-04-28-add-follow-up-response-mode.sql). Retrying with null. Supabase:',
+      error.message
+    );
+    ({ data, error } = await serviceClient
+      .from('messages')
+      .insert({ ...row, response_mode: null })
+      .select()
+      .single());
+  }
+
   if (error || !data) {
+    console.warn(
+      '[storeMessage] Supabase insert failed:',
+      error?.message,
+      error?.details,
+      error?.code
+    );
     throw { status: 500, message: 'Failed to store message.' };
   }
 

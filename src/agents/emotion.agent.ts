@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Emotion Agent — hybrid (rule-based lexicon + LLM fallback)
 //
-// Mirrors the Intent Agent's pattern (callGemini with FALLBACK_INTENT_MODEL):
+// Mirrors the Intent Agent's pattern (LLM via model-router with primary/fallback):
 //   1. Rule-based lexicon pass (deterministic, no network).
 //   2. If the rule pass returns 'neutral' or low confidence AND we are not in
 //      test mode, ask the configured small/cheap model for a second opinion.
@@ -15,7 +15,7 @@
 import type { EmotionLabel, EmotionResult } from '../contracts/emotion.contract';
 
 import { scoreEmotionRuleBased }      from '../utils/emotion-lexicon';
-import { callGemini }                 from '../llm/gemini.client';
+import { callWithFallback }         from '../llm/model-router';
 import { buildEmotionMessages }       from '../llm/prompts/emotion.prompt';
 import { env }                        from '../config/env';
 
@@ -66,16 +66,18 @@ function neutralFallback(reason: string): EmotionResult {
 // ---------------------------------------------------------------------------
 
 async function classifyEmotionLLM(userMessage: string): Promise<EmotionResult | null> {
-  if (!env.GOOGLE_AI_STUDIO_API_KEY) return null;
+  if (!env.GOOGLE_AI_STUDIO_API_KEY && !env.MISTRAL_API_KEY) return null;
 
   try {
     const messages = buildEmotionMessages(userMessage);
 
-    const llmResponse = await callGemini({
+    const llmResponse = await callWithFallback({
       messages,
-      model:       env.FALLBACK_INTENT_MODEL, // small/cheap model (matches Intent Agent)
-      temperature: 0.1,
-      maxTokens:   256,
+      primaryModel:  env.PRIMARY_TRIAGE_MODEL,
+      fallbackModel: env.FALLBACK_TRIAGE_MODEL,
+      temperature:   0.1,
+      maxTokens:     256,
+      agentName:     'EmotionAgent',
     });
 
     const raw = llmResponse.text.trim();

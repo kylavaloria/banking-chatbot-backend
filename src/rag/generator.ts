@@ -1,11 +1,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // RAG answer generator
 // Grounds the answer in retrieved KB chunks.
-// Uses Groq (llama-3.1-8b) — fast and free-tier friendly for short answers.
+// Grounds the answer in retrieved KB chunks via primary/fallback LLM routing.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { callGemini } from '../llm/gemini.client';
-import { env }         from '../config/env';
+import { callWithFallback } from '../llm/model-router';
 import type { ScoredChunk, RAGAnswer } from './types';
 
 const FALLBACK_ANSWER =
@@ -42,15 +41,27 @@ export async function generateRAGAnswer(
 
   const userContent = `Knowledge base excerpts:\n${context}\n\nCustomer question: ${query}\n\nAnswer:`;
 
+  // Call-time env read (Vitest `vi.stubEnv` runs after hoisted `vi.mock`).
+  // Prefer legacy `RAG_GENERATION_MODEL` when set so existing tests and .env
+  // layouts keep working; otherwise use `PRIMARY_RAG_GENERATION_MODEL`.
+  const primaryRag =
+    process.env['RAG_GENERATION_MODEL'] ||
+    process.env['PRIMARY_RAG_GENERATION_MODEL'] ||
+    'mistral-small-2603';
+  const fallbackRag =
+    process.env['FALLBACK_RAG_GENERATION_MODEL'] || 'gemini-2.5-flash-lite';
+
   try {
-    const response = await callGemini({
+    const response = await callWithFallback({
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user',   content: userContent },
       ],
-      model:       env.RAG_GENERATION_MODEL,
-      temperature: 0.2,
-      maxTokens:   300,
+      primaryModel:  primaryRag,
+      fallbackModel: fallbackRag,
+      temperature:   0.2,
+      maxTokens:     300,
+      agentName:     'RAGGenerator',
     });
 
     const text = response.text.trim();

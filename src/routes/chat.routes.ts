@@ -10,6 +10,7 @@ import { resolveCustomer }            from '../services/customer.service';
 import { getOrCreateActiveSession }   from '../services/session.service';
 import { storeMessage }               from '../services/message.service';
 import { processMessage }             from '../orchestrator/entry-route';
+import { FOLLOW_UP_ASSISTANT_FALLBACK } from '../agents/response.agent';
 
 interface TicketDetail {
   ticket_id:   string;
@@ -72,14 +73,16 @@ router.get('/messages', authMiddleware, async (req: Request, res: Response): Pro
       .from('messages')
       .select('message_id, sender_type, message_text, response_mode, case_id, ticket_id, created_at')
       .eq('session_id', session.session_id)
-      .order('created_at', { ascending: true })
-      .limit(50); // last 50 messages
+      .order('created_at', { ascending: false })
+      .limit(50);
 
     if (error) throw { status: 500, message: 'Failed to load message history.' };
 
+    const messagesChronological = [...(data ?? [])].reverse();
+
     res.json({
       sessionId: session.session_id,
-      messages:  data ?? [],
+      messages:  messagesChronological,
     });
   } catch (err: any) {
     res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error.' });
@@ -132,15 +135,19 @@ router.post('/message', authMiddleware, async (req: Request, res: Response): Pro
 
     const result = await processMessage(customer_id, session_id, trimmedMessage, persistFn);
 
-    // Backfill case_id on the user message when it was stored before the case existed
-    // (first message of a new case has case_id = null at insert time).
-    if (!session.current_case_id && result.case_id) {
+    // User row is inserted before orchestration using session.current_case_id.
+    // When a NEW case is created (e.g. topic switch) while the session still
+    // pointed at a previous case, that user message must be aligned to
+    // result.case_id or it will appear under the wrong ticket in agent history.
+    if (result.case_id != null && userMessage.case_id !== result.case_id) {
       await serviceClient
         .from('messages')
         .update({ case_id: result.case_id })
         .eq('message_id', userMessage.message_id)
         .then(({ error }) => {
-          if (error) console.warn('[chat.routes] Failed to backfill case_id on user message:', error.message);
+          if (error) {
+            console.warn('[chat.routes] Failed to align case_id on user message:', error.message);
+          }
         });
     }
 
@@ -161,15 +168,26 @@ router.post('/message', authMiddleware, async (req: Request, res: Response): Pro
     // Persist assistant reply for non-card-block branches
     // (card-block branch persists its own reply inside entry-route via persistFn)
     if (!result.message_id) {
-      const assistantMessage = await storeMessage({
-        sessionId:    session_id,
-        caseId:       result.case_id   ?? session.current_case_id ?? null,
-        ticketId:     result.ticket_id ?? null,
-        senderType:   'assistant',
-        messageText:  result.assistant_text,
-        responseMode: result.response_mode,
-      });
-      result.message_id = assistantMessage.message_id;
+      try {
+        const assistantMessage = await storeMessage({
+          sessionId:    session_id,
+          caseId:       result.case_id   ?? session.current_case_id ?? null,
+          ticketId:     result.ticket_id ?? null,
+          senderType:   'assistant',
+          messageText:  result.assistant_text,
+          responseMode: result.response_mode,
+        });
+        result.message_id = assistantMessage.message_id;
+      } catch (saveErr) {
+        if (result.response_mode === 'follow_up_update') {
+          console.warn(
+            '[chat.routes] Assistant storeMessage failed in follow-up flow:',
+            saveErr instanceof Error ? saveErr.message : saveErr
+          );
+        } else {
+          throw saveErr;
+        }
+      }
     }
 
     const allTicketIds = result.ticket_ids?.length
@@ -180,10 +198,19 @@ router.post('/message', authMiddleware, async (req: Request, res: Response): Pro
 
     const ticketDetails = await fetchTicketDetails(allTicketIds);
 
+    let reply = typeof result.assistant_text === 'string' ? result.assistant_text : '';
+    if (!reply.trim()) {
+      console.error('[chat.routes] Empty reply for responseMode:', result.response_mode);
+      reply =
+        result.response_mode === 'follow_up_update'
+          ? FOLLOW_UP_ASSISTANT_FALLBACK
+          : 'Your concern has been noted and your case is being reviewed.';
+    }
+
     const responseBody: Record<string, unknown> = {
       sessionId:     session_id,
       messageId:     result.message_id,
-      reply:         result.assistant_text,
+      reply,
       responseMode:  result.response_mode,
       caseId:        result.case_id   ?? null,
       ticketId:      result.ticket_id ?? null,

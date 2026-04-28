@@ -410,14 +410,13 @@ router.get('/analytics/emotions', authMiddleware, async (req: Request, res: Resp
 
 /**
  * GET /api/agent/tickets/:ticketId/conversation
- * Returns the full message history for a ticket's session, with per-message
- * emotion data. Only user messages carry emotion_label / emotion_intensity.
+ * Returns message history for this ticket's case only (scoped by case_id),
+ * with per-message emotion data. Only user messages carry emotion_label / emotion_intensity.
  */
 router.get('/tickets/:ticketId/conversation', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const { ticketId } = req.params;
 
-    // Step 1: resolve ticket → case_id
     const { data: ticketRow, error: ticketError } = await serviceClient
       .from('tickets')
       .select('case_id')
@@ -431,14 +430,6 @@ router.get('/tickets/:ticketId/conversation', authMiddleware, async (req: Reques
 
     const caseId = ticketRow.case_id;
 
-    // Step 2: resolve case → session_id (needed to recover orphaned first message)
-    const { data: caseRow } = await serviceClient
-      .from('cases')
-      .select('session_id')
-      .eq('case_id', caseId)
-      .maybeSingle();
-
-    // Step 3: fetch all messages that belong to this case
     const { data, error } = await serviceClient
       .from('messages')
       .select(`
@@ -458,52 +449,16 @@ router.get('/tickets/:ticketId/conversation', authMiddleware, async (req: Reques
       return;
     }
 
-    const caseMessages = data ?? [];
-
-    // Step 4: recover the orphaned first user message.
-    // When a customer sends their very first message in a new case, it is
-    // persisted before orchestration runs (so the case doesn't exist yet),
-    // leaving that row with case_id = null. If the earliest message we have
-    // for this case is an assistant reply, the user message that triggered it
-    // is orphaned. Fetch it by finding the most-recent user message with
-    // case_id = null in the same session sent before the first case message.
-    if (caseRow?.session_id && caseMessages.length > 0 && caseMessages[0].sender_type === 'assistant') {
-      const firstCaseMessageTime = caseMessages[0].created_at;
-
-      const { data: orphan } = await serviceClient
-        .from('messages')
-        .select(`
-          message_id,
-          sender_type,
-          message_text,
-          response_mode,
-          emotion_label,
-          emotion_intensity,
-          created_at
-        `)
-        .eq('session_id', caseRow.session_id)
-        .is('case_id', null)
-        .eq('sender_type', 'user')
-        .lt('created_at', firstCaseMessageTime)
-        .order('created_at', { ascending: false })
-        .limit(1);
-
-      if (orphan?.[0]) {
-        caseMessages.unshift(orphan[0]);
-      }
-    }
-
-    // Secondary sort: when two messages share an identical timestamp, ensure
-    // the user message appears before the assistant reply it triggered.
-    caseMessages.sort((a, b) => {
-      const timeDiff = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+    const messages = (data ?? []).sort((a, b) => {
+      const timeDiff =
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
       if (timeDiff !== 0) return timeDiff;
       if (a.sender_type === 'user' && b.sender_type === 'assistant') return -1;
       if (a.sender_type === 'assistant' && b.sender_type === 'user') return 1;
       return 0;
     });
 
-    res.json({ messages: caseMessages });
+    res.json({ messages });
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? 'Internal server error.' });
   }

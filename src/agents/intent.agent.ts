@@ -35,7 +35,7 @@ import {
   normalizeIntentResult, buildFallbackIntentResult, normalizeEntities,
 } from '../utils/normalizers';
 
-import { callGemini }           from '../llm/gemini.client';
+import { callWithFallback }     from '../llm/model-router';
 import { extractJSON }         from '../utils/json-extract';
 import { buildIntentMessages } from '../llm/prompts/intent.prompt';
 import { env }                 from '../config/env';
@@ -281,10 +281,18 @@ function resolveConsistency(
   activeCase: ActiveCaseContext | null
 ): CaseConsistency {
   if (!activeCase) return 'no_active_case';
-  if (activeCase.primary_intent_type === intentType) return 'same_case';
+
   if (intentType === 'complaint_follow_up') return 'same_case';
-  if (intentType === 'general_complaint')   return 'possible_topic_switch';
-  if (OPERATIONAL_INTENTS.has(intentType))  return 'new_issue';
+
+  if (activeCase.primary_intent_type === intentType) return 'same_case';
+
+  if (intentType === 'unclear_issue') return 'same_case';
+  if (intentType === 'general_complaint') return 'same_case';
+
+  if (INFORMATIONAL_INTENTS.has(intentType)) return 'same_case';
+
+  if (OPERATIONAL_INTENTS.has(intentType)) return 'new_issue';
+
   return 'possible_topic_switch';
 }
 
@@ -544,10 +552,7 @@ function collapseFraudOnlyFalseMultiIssue(
 // LLM-backed classification
 // ---------------------------------------------------------------------------
 
-async function classifyIntentLLM(
-  input: IntentAgentInput,
-  model: string
-): Promise<IntentResult | null> {
+async function classifyIntentLLM(input: IntentAgentInput): Promise<IntentResult | null> {
   try {
     const messages = buildIntentMessages(
       input.userMessage,
@@ -556,18 +561,20 @@ async function classifyIntentLLM(
       input.clarificationContext ?? null
     );
 
-    const llmResponse = await callGemini({
+    const llmResponse = await callWithFallback({
       messages,
-      model,
-      temperature: 0.1,
-      maxTokens:   1024,
+      primaryModel:  env.PRIMARY_INTENT_MODEL,
+      fallbackModel: env.FALLBACK_INTENT_MODEL,
+      temperature:   0.1,
+      maxTokens:     1024,
+      agentName:     'IntentAgent',
     });
 
     const parsed = extractJSON(llmResponse.text);
     if (!parsed) {
       console.warn('[IntentAgent] LLM returned unparseable JSON', {
-        model,
-        text: llmResponse.text.slice(0, 200),
+        primaryModel: env.PRIMARY_INTENT_MODEL,
+        text:         llmResponse.text.slice(0, 200),
       });
       return null;
     }
@@ -745,17 +752,17 @@ export async function classifyIntent(input: IntentAgentInput): Promise<IntentRes
     }
   }
 
-  // ── Step 4: LLM routing + call (single-intent messages only) ─────────────
-  const useSimpleRouting = env.INTENT_USE_SIMPLE_ROUTING !== 'false';
+  // ── Step 4: LLM call (single-intent messages only) — primary/fallback via model-router ──
   const simple = isSimpleMessage(normalizedText);
-  const model  = useSimpleRouting && simple
-    ? env.FALLBACK_INTENT_MODEL   // llama-3.1-8b-instant
-    : env.PRIMARY_INTENT_MODEL;   // llama-3.3-70b-versatile
 
   if (env.NODE_ENV !== 'test') {
-    const llmResult = await classifyIntentLLM(input, model);
+    const llmResult = await classifyIntentLLM(input);
     if (llmResult) {
-      (llmResult as any)._routing = { simple, model_used: model };
+      (llmResult as any)._routing = {
+        simple,
+        primaryModel:  env.PRIMARY_INTENT_MODEL,
+        fallbackModel: env.FALLBACK_INTENT_MODEL,
+      };
       return llmResult;
     }
     console.warn('[IntentAgent] Falling back to rule-based classifier');

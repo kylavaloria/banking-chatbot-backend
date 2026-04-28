@@ -18,4 +18,6 @@ export interface ResponseInput {
   informational_answer?:      string | null;
   clarification_question?:    string | null;
   refusal_reason?:            'unsupported_request' | 'malicious_input' | null;
+  /** Set when updating an existing open case without creating a new ticket */
+  is_follow_up?:              boolean;
 }

@@ -7,12 +7,28 @@ import type { ActionResult }         from '../contracts/action.contract';
 import type { IntentResult }         from '../contracts/intent.contract';
 import type { TriageResult }         from '../contracts/triage.contract';
 import type { ResponseInput }        from '../contracts/response.contract';
+import type { EmotionResult }        from '../contracts/emotion.contract';
+import type { ActiveCaseContext }    from '../contracts/orchestration.contract';
 import type { PolicyOutput }         from './policy.agent';
 import type { ClarificationContext } from './intent.agent';
 
-import { callMistral }             from '../llm/mistral';
+import { callWithFallback }      from '../llm/model-router';
 import { buildResponseMessages }   from '../llm/prompts/response.prompt';
 import { env }                     from '../config/env';
+
+/** Generic fallback when follow-up LLM fails — must not quote case summary */
+export function buildFollowUpTemplate(
+  _activeCase: ActiveCaseContext | null,
+  _userMessage: string
+): string {
+  return (
+    'I understand your concern and I\'m sorry you\'re still waiting. ' +
+    'Your case is already with our team and they are actively working on it. ' +
+    'We will follow up with you as soon as possible. Thank you for your patience.'
+  );
+}
+
+export const FOLLOW_UP_ASSISTANT_FALLBACK = buildFollowUpTemplate(null, '');
 
 export interface ResponseAgentInput {
   actionResult:              ActionResult;
@@ -24,6 +40,12 @@ export interface ResponseAgentInput {
   hybridInformationalAnswer?:string | null;
   topicSwitched?:            boolean;
   emotionLabel?:             string;
+  emotionResult?:            EmotionResult | null;
+  /** Latest customer message — required for contextual follow-up replies */
+  userMessage?:              string;
+  activeCase?:               ActiveCaseContext | null;
+  /** True when the customer is continuing an open case; no new ticket was created */
+  isFollowUp?:               boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -32,6 +54,8 @@ export interface ResponseAgentInput {
 
 function buildActionsTakenList(actionResult: ActionResult, topicSwitched?: boolean): string[] {
   switch (actionResult.response_mode) {
+    case 'follow_up_update':
+      return [];
     case 'ticket_confirmation':
       return [
         topicSwitched
@@ -65,6 +89,10 @@ function buildNextStep(
   topicSwitched?: boolean
 ): string {
   switch (mode) {
+    case 'follow_up_update':
+      return triageResult?.priority === 'P1'
+        ? 'Your case remains with our priority team — we will update you as soon as we can.'
+        : 'Our team continues to work on your existing case and will follow up with you.';
     case 'ticket_confirmation':
       if (topicSwitched)
         return 'Your new concern is being handled separately. Our team will follow up on both cases.';
@@ -93,7 +121,8 @@ function buildNextStep(
 function buildResponseInput(input: ResponseAgentInput): ResponseInput {
   const { actionResult, intentResult, triageResult, policyOutput, clarificationContext, topicSwitched } = input;
   const mode          = actionResult.response_mode;
-  const intentLabel   = intentResult.intent_type.replace(/_/g, ' ');
+  const intentTypeRaw = intentResult.intent_type ?? 'unclear_issue';
+  const intentLabel   = String(intentTypeRaw).replace(/_/g, ' ');
   const intentSummary = intentResult.issue_components[0]?.summary
     ?? `Your concern regarding ${intentLabel}`;
 
@@ -108,6 +137,7 @@ function buildResponseInput(input: ResponseAgentInput): ResponseInput {
     informational_answer:      actionResult.informational_payload?.answer_text ?? null,
     clarification_question:    actionResult.clarification_payload?.question ?? null,
     refusal_reason:            actionResult.refusal_payload?.reason ?? null,
+    is_follow_up:              input.isFollowUp === true,
   };
 }
 
@@ -239,6 +269,9 @@ function renderTemplate(
       ].join('\n');
     }
 
+    case 'follow_up_update':
+      return buildFollowUpTemplate(null, '');
+
     case 'refusal':
       return [
         'Thank you for reaching out.',
@@ -265,6 +298,50 @@ function renderTemplate(
 // Mistral generation
 // ---------------------------------------------------------------------------
 
+async function generateFollowUpWithLlm(
+  responseInput: ResponseInput,
+  extra: {
+    hybridAnswer?:     string | null;
+    topicSwitched?:    boolean;
+    ticketCount?:      number;
+    cardBlockOutcome?: 'confirmed' | 'declined' | null;
+    emotionLabel?:     string;
+  },
+  meta: { userMessage: string; emotionResult?: EmotionResult | null }
+): Promise<string | null> {
+  try {
+    const messages = buildResponseMessages(responseInput, {
+      hybridInformationalAnswer: extra.hybridAnswer ?? null,
+      topicSwitched:             extra.topicSwitched,
+      ticketCount:               extra.ticketCount,
+      cardBlockOutcome:          extra.cardBlockOutcome,
+      emotionLabel:              extra.emotionLabel,
+      isFollowUp:                true,
+      followUpUserMessage:       meta.userMessage || null,
+      followUpEmotionResult:     meta.emotionResult ?? null,
+    });
+
+    const llmResponse = await callWithFallback({
+      messages,
+      primaryModel:  env.PRIMARY_RESPONSE_MODEL,
+      fallbackModel: env.FALLBACK_RESPONSE_MODEL,
+      temperature:   0.7,
+      maxTokens:     300,
+      agentName:     'ResponseAgent-FollowUp',
+    });
+
+    const text = llmResponse.text?.trim() ?? '';
+    if (text.length > 20) return text;
+    return null;
+  } catch (err) {
+    console.warn(
+      '[ResponseAgent] LLM failed for follow-up, using template fallback',
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
+}
+
 async function generateWithMistral(
   input: ResponseInput,
   extra: {
@@ -273,6 +350,7 @@ async function generateWithMistral(
     topicSwitched?:    boolean;
     ticketCount?:      number;
     emotionLabel?:     string;
+    isFollowUp?:       boolean;
   }
 ): Promise<string | null> {
   try {
@@ -282,13 +360,16 @@ async function generateWithMistral(
       ticketCount:               extra.ticketCount,
       cardBlockOutcome:          extra.cardBlockOutcome,
       emotionLabel:              extra.emotionLabel,
+      isFollowUp:                extra.isFollowUp === true,
     });
 
-    const llmResponse = await callMistral({
+    const llmResponse = await callWithFallback({
       messages,
-      model:       env.RESPONSE_MODEL,
-      temperature: 0.4,
-      maxTokens:   512,
+      primaryModel:  env.PRIMARY_RESPONSE_MODEL,
+      fallbackModel: env.FALLBACK_RESPONSE_MODEL,
+      temperature:   0.4,
+      maxTokens:     512,
+      agentName:     'ResponseAgent',
     });
 
     const text = llmResponse.text.trim();
@@ -318,10 +399,14 @@ export async function generateResponse(input: ResponseAgentInput): Promise<strin
     topicSwitched:    input.topicSwitched ?? false,
     actionResult:     input.actionResult,
     ticketCount:      input.actionResult.created_ticket_ids?.length,
-    emotionLabel:     input.emotionLabel,
+    emotionLabel:     input.emotionLabel ?? input.emotionResult?.label,
+    isFollowUp:       input.isFollowUp === true,
   };
 
   if (env.NODE_ENV === 'test') {
+    if (input.actionResult.response_mode === 'follow_up_update') {
+      return buildFollowUpTemplate(input.activeCase ?? null, input.userMessage ?? '');
+    }
     return renderTemplate(responseInput, extra);
   }
 
@@ -329,6 +414,15 @@ export async function generateResponse(input: ResponseAgentInput): Promise<strin
   // Mistral is not given the KB facts in its brief; paraphrase would distort amounts/currency.
   if (input.actionResult.response_mode === 'informational') {
     return renderTemplate(responseInput, extra);
+  }
+
+  if (input.actionResult.response_mode === 'follow_up_update') {
+    const llmOut = await generateFollowUpWithLlm(responseInput, extra, {
+      userMessage:   input.userMessage ?? '',
+      emotionResult: input.emotionResult ?? null,
+    });
+    if (llmOut) return llmOut;
+    return buildFollowUpTemplate(input.activeCase ?? null, input.userMessage ?? '');
   }
 
   const llmText = await generateWithMistral(responseInput, extra);

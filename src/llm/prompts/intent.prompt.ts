@@ -157,6 +157,17 @@ OUTPUT FORMAT (return exactly this JSON structure, no other text):
   "evidence": ["<short reason string>"]
 }
 
+consistency_with_active_case (read carefully when ACTIVE CASE is present in context):
+- "same_case" — follow-up, update, or emotional continuation of the active case. Use when the
+  customer is clearly still on the same issue, even if phrased differently.
+- "possible_topic_switch" — may relate to the active case but introduces a potentially different concern.
+- "new_issue" — clearly a completely different operational problem unrelated to the active case.
+- "no_active_case" — no active case exists.
+
+IMPORTANT: When an active case exists, default to "same_case" unless the customer explicitly
+introduces a completely different issue type. Emotional follow-ups ("I'm worried", "still nothing"),
+vague updates ("any news?"), and complaints about the same topic are always "same_case".
+
 CLASSIFICATION RULES:
 - confidence >= 0.85: clear intent
 - confidence 0.60-0.84: moderate confidence (caller will handle clarification)
