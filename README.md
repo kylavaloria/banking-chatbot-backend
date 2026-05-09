@@ -245,6 +245,6 @@ npm test
 
 <div align="center">
 
-Private — Polytechnic University of the Philippines, 2026
+Private — Kyla Mae Valoria · Polytechnic University of the Philippines, 2026
 
 </div>
