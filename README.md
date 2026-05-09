@@ -1,34 +1,82 @@
+<div align="center">
+
 # Zeni — BFSI Chatbot Backend
 
-> AI-orchestrated customer support backend for Banking, Financial Services, and Insurance.
-> Built with Express + TypeScript. Powered by a multi-agent pipeline with LLM primary/fallback routing.
+**AI-orchestrated customer support for Banking, Financial Services, and Insurance**
+
+![Express](https://img.shields.io/badge/Express-000000?style=flat-square&logo=express&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)
+![Supabase](https://img.shields.io/badge/Supabase-3ECF8E?style=flat-square&logo=supabase&logoColor=white)
+![Gemini](https://img.shields.io/badge/Gemini-8E75B2?style=flat-square&logo=google&logoColor=white)
+![Mistral](https://img.shields.io/badge/Mistral_AI-FF7000?style=flat-square&logoColor=white)
+![Status](https://img.shields.io/badge/Status-Active-brightgreen?style=flat-square)
+
+[Overview](#overview) · [Pipeline](#agent-pipeline) · [API](#api-reference) · [Setup](#getting-started) · [Testing](#testing)
+
+</div>
 
 ---
 
 ## Overview
 
-Zeni is the backend for a multi-agent chatbot that triages customer concerns, creates structured support tickets, and generates empathetic responses — all without human intervention on routine cases.
+Zeni is the backend for a multi-agent BFSI chatbot that triages customer concerns, creates structured support tickets, and generates empathetic, tone-calibrated responses — without human intervention on routine cases.
 
-The system routes each message through a sequential agent pipeline:
+Each message is routed through a sequential agent pipeline. Informational queries are deflected to the RAG subsystem; operational concerns flow through triage, policy, and action agents before a response is generated.
 
+---
+
+## Agent Pipeline
+
+```mermaid
+flowchart TD
+    A([Customer Message]) --> B{Entry Route}
+
+    B -->|Informational| C[RAG Pipeline]
+    C --> C1[(Vector Store\nSQLite + Mistral Embed)]
+    C1 --> C2[RAG Generator\nMistral / Gemini]
+    C2 --> Z([Response])
+
+    B -->|Operational| D[Intent Agent\nGemini · LLM]
+    D --> E[Emotion Agent\nRule-based + LLM · parallel]
+    D --> F[Triage Agent\nGemini · LLM]
+    F --> G[Policy Agent\nDeterministic]
+    G --> H[Action Agent\nDeterministic]
+    H --> I[(Supabase\nPostgreSQL)]
+    E --> J[Response Agent\nMistral · LLM]
+    H --> J
+    J --> Z
 ```
-Customer Message
-      │
-      ▼
-  Entry Route ──► Informational? ──► RAG Pipeline ──► Response
-      │
-      ▼ Operational
-  Intent Agent       classify intent + detect multi-issue
-      │
-  Emotion Agent      detect emotion label + intensity (parallel)
-      │
-  Triage Agent       extract signals, compute P1/P2/P3 priority
-      │
-  Policy Agent       map priority → resolution path + SLA params
-      │
-  Action Agent       create case, ticket, case_actions in Supabase
-      │
-  Response Agent     generate tone-calibrated customer reply
+
+### Agents
+
+| Agent | Type | Role |
+|---|---|---|
+| **Intent Agent** | LLM | Classifies into 15+ intent types across informational, operational, and out-of-scope groups |
+| **Emotion Agent** | Hybrid (rule + LLM) | Detects emotion label (`angry` `frustrated` `anxious` `distressed` `neutral`) and intensity — runs in parallel |
+| **Triage Agent** | LLM | Extracts fraud/urgency signals, computes P1–P3 priority via importance × urgency matrix |
+| **Policy Agent** | Deterministic | Maps priority to resolution path — P1 → live escalation, P2 → urgent ticket, P3 → standard |
+| **Action Agent** | Deterministic | Executes Supabase writes — cases, tickets, case_actions, card-block confirmation flows |
+| **Response Agent** | LLM | Generates tone-calibrated reply using full pipeline context |
+
+### Priority Matrix
+
+| Priority | Trigger | Resolution |
+|---|---|---|
+| **P1 — Critical** | Active fraud, lost/stolen card | Live escalation |
+| **P2 — Urgent** | Account access/restriction issues | Urgent ticket |
+| **P3 — Standard** | Transfers, refunds, billing disputes | Standard ticket |
+| **Informational** | Product, fee, policy, branch queries | RAG response — no ticket created |
+
+### Model Routing
+
+Every LLM call goes through a primary/fallback router. On retryable errors (429, 503, 404) the router automatically switches providers with no manual intervention.
+
+```mermaid
+flowchart LR
+    A[Agent Call] --> B[Primary Model\nGemini]
+    B -->|429 / 503 / 404| C[Fallback Model\nMistral]
+    B -->|OK| D([Response])
+    C -->|OK| D
 ```
 
 ---
@@ -37,44 +85,14 @@ Customer Message
 
 | Layer | Technology |
 |---|---|
-| Runtime | Node.js + TypeScript |
+| Runtime | Node.js 20 + TypeScript |
 | Framework | Express 4 |
 | Database | Supabase (PostgreSQL) |
 | LLM Providers | Gemini (Google AI Studio), Mistral AI |
 | RAG | Mistral Embed + SQLite vector store |
 | Auth | Supabase Bearer token |
-| Rate Limiting | express-rate-limit (per-user + per-IP) |
+| Rate Limiting | express-rate-limit — per-user + per-IP |
 | Testing | Vitest |
-
----
-
-## Agent Pipeline
-
-| Agent | Type | Role |
-|---|---|---|
-| **Intent Agent** | LLM | Classifies into 15+ intent types across informational, operational, and out-of-scope groups |
-| **Emotion Agent** | Hybrid (rule + LLM) | Detects emotion label (`angry`, `frustrated`, `anxious`, `distressed`, `neutral`) and intensity |
-| **Triage Agent** | LLM | Extracts fraud/urgency signals, computes P1–P3 priority via importance × urgency matrix |
-| **Policy Agent** | Deterministic | Maps priority to resolution path — P1 → live escalation, P2 → urgent ticket, P3 → standard ticket |
-| **Action Agent** | Deterministic | Executes Supabase writes — cases, tickets, case_actions, card-block flows |
-| **Response Agent** | LLM | Generates tone-calibrated reply using full pipeline context |
-
-### Priority Matrix
-
-| Priority | Trigger | Resolution |
-|---|---|---|
-| **P1 Critical** | Active fraud, lost/stolen card | Live escalation |
-| **P2 Urgent** | Account access/restriction issues | Urgent ticket |
-| **P3 Standard** | Transfers, refunds, billing disputes | Standard ticket |
-| **Informational** | Product, fee, policy, branch queries | RAG response — no ticket |
-
-### Model Routing
-
-Every LLM call goes through a primary/fallback router. If the primary model returns a retryable error (429, 503, 404), the router automatically falls back to the secondary model with no manual intervention.
-
-```
-Primary (Gemini)  ──► fail ──► Fallback (Mistral)
-```
 
 ---
 
@@ -110,7 +128,7 @@ All protected routes require `Authorization: Bearer <supabase_token>`.
 
 ### Rate Limits
 
-| Scope | Limit | Key |
+| Scope | Limit | Keyed By |
 |---|---|---|
 | Global | 120 req/min | IP |
 | `POST /api/chat/message` | 10 req/min | User ID → IP fallback |
@@ -164,17 +182,16 @@ cp .env.example .env
 ### Running
 
 ```bash
-# Development (hot reload)
+# Development — hot reload
 npm run dev
 
 # Production build
-npm run build
-npm start
+npm run build && npm start
 
 # Run test suite
 npm test
 
-# Ingest knowledge base documents
+# Ingest knowledge base documents into vector store
 npm run ingest-kb
 
 # Run SLA evaluation job
@@ -211,10 +228,23 @@ The integration test suite covers 70 scenarios across 11 groups — informationa
 npm test
 ```
 
-Final test run: **66/70 passing (94.3%)** — the 4 failures were LLM non-determinism in edge cases and one API rate-limit timeout.
+**Final result: 66/70 passing (94.3%)** — the 4 failures were LLM non-determinism in edge cases and one API rate-limit timeout during test execution.
+
+| Test Group | Scenarios | Coverage |
+|---|---|---|
+| Informational (RAG) | 15 | Product, fee, policy, branch — no ticket created |
+| P3 Operational | 10 | Standard ticket creation, correct priority |
+| P1 Critical | 8 | Fraud/card-loss detection, live escalation |
+| Card Block Flows | 6 | Multi-turn YES/NO confirmation |
+| Multi-Issue | 4 | Two+ distinct concerns, multiple tickets |
+| Hybrid (Info + Operational) | 3 | Combined RAG + ticket |
+| Security / Malicious Input | 3 | Prompt injection, data exfiltration — all refused |
+| Edge Cases | 12 | Topic switch, broken English, follow-up |
 
 ---
 
-## License
+<div align="center">
 
-Private — Polytechnic University of the Philippines, 2026.
+Private — Polytechnic University of the Philippines, 2026
+
+</div>
