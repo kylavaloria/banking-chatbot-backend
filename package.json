@@ -9,7 +9,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "ingest-kb": "ts-node scripts/ingest-kb.ts",
-    "sla-job":   "ts-node src/jobs/run-sla-job.ts"
+    "sla-job": "ts-node src/jobs/run-sla-job.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
@@ -17,6 +17,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "express-rate-limit": "^8.5.1",
     "uuid": "^9.0.0"
   },
   "devDependencies": {
