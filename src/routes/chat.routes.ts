@@ -5,6 +5,7 @@
 
 import { Router, Request, Response } from 'express';
 import { authMiddleware }             from '../middleware/auth';
+import { chatMessageLimiter, chatSessionLimiter } from '../middleware/rate-limit';
 import { serviceClient }              from '../config/supabase';
 import { resolveCustomer }            from '../services/customer.service';
 import { getOrCreateActiveSession }   from '../services/session.service';
@@ -46,7 +47,7 @@ async function fetchTicketDetails(
 
 const router = Router();
 
-router.post('/session', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+router.post('/session', authMiddleware, chatSessionLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
     const { authUserId, email } = req.user!;
     const customer = await resolveCustomer(authUserId, email);
@@ -89,7 +90,7 @@ router.get('/messages', authMiddleware, async (req: Request, res: Response): Pro
   }
 });
 
-router.post('/message', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+router.post('/message', authMiddleware, chatMessageLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
     const { authUserId, email } = req.user!;
     const { messageText }       = req.body;
