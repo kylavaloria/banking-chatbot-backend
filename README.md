@@ -217,4 +217,4 @@ Final test run: **66/70 passing (94.3%)** — the 4 failures were LLM non-determ
 
 ## License
 
-Private — Polytechnic University of the Philippines, 2026.
+Private — Kyla Mae Valoria, 2026.
