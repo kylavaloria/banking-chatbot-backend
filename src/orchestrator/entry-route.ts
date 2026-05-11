@@ -38,6 +38,29 @@ import type { SupportedIntentType }   from '../contracts/intent.contract';
 
 const RECENT_MESSAGE_LIMIT = 8;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Performance timing helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface PipelineTimings {
+  total_ms:            number;
+  context_load_ms:     number;
+  intent_emotion_ms:   number;
+  conversation_mgr_ms: number;
+  response_mode?:      string;
+  is_card_block?:      boolean;
+  is_malicious?:       boolean;
+  is_follow_up?:       boolean;
+  agent_branch?:       string;
+}
+
+function logTimings(timings: PipelineTimings): void {
+  console.log('[Perf]', JSON.stringify({
+    ...timings,
+    timestamp: new Date().toISOString(),
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // Malicious input detection
 // Mirrors the logic in intent.agent.ts but runs here independently so that
@@ -210,9 +233,13 @@ export async function processMessage(
   }) => Promise<{ message_id: string }>
 ): Promise<OrchestratorResult> {
 
+  const t_start = Date.now();
+
   // ── Step 1: Load context ──────────────────────────────────────────────────
   const conversation = await loadConversationContext(customerId, sessionId);
   const { active_case: activeCase, recent_messages } = conversation;
+
+  const t_context = Date.now();
 
   // ── Step 2: Malicious input gate ──────────────────────────────────────────
   // Must run before every other branch — including card-block confirmation.
@@ -226,6 +253,16 @@ export async function processMessage(
       senderType:  'assistant',
       messageText: REFUSAL_TEXT,
       responseMode:'refusal',
+    });
+
+    logTimings({
+      total_ms:            Date.now() - t_start,
+      context_load_ms:     t_context - t_start,
+      intent_emotion_ms:   0,
+      conversation_mgr_ms: 0,
+      response_mode:       'refusal',
+      is_malicious:        true,
+      agent_branch:        'malicious_gate',
     });
 
     return {
@@ -330,6 +367,17 @@ export async function processMessage(
         responseMode:'critical_action_confirmation',
       });
 
+      const t_card_block_end = Date.now();
+      logTimings({
+        total_ms:            t_card_block_end - t_start,
+        context_load_ms:     t_context - t_start,
+        intent_emotion_ms:   0,
+        conversation_mgr_ms: t_card_block_end - t_context,
+        response_mode:       'critical_action_confirmation',
+        is_card_block:       true,
+        agent_branch:        'card_block_confirmation',
+      });
+
       return {
         assistant_text: assistantText,
         response_mode:  'critical_action_confirmation',
@@ -362,6 +410,8 @@ export async function processMessage(
     })),
   ]);
 
+  const t_intent_emotion = Date.now();
+
   // ── Step 6: Build pipeline context and run Conversation Manager ───────────
   const pipelineCtx: PipelineContext = {
     conversation,
@@ -370,5 +420,22 @@ export async function processMessage(
     emotion_result: emotionResult,
   };
 
-  return runConversationManager(pipelineCtx, clarificationContext);
+  const managerResult = await runConversationManager(pipelineCtx, clarificationContext);
+
+  const t_end = Date.now();
+  logTimings({
+    total_ms:            t_end - t_start,
+    context_load_ms:     t_context - t_start,
+    intent_emotion_ms:   t_intent_emotion - t_context,
+    conversation_mgr_ms: t_end - t_intent_emotion,
+    response_mode:       managerResult.response_mode,
+    is_card_block:       false,
+    is_malicious:        false,
+    is_follow_up:        managerResult.response_mode === 'follow_up_update',
+    agent_branch:        managerResult.case_id
+                           ? (managerResult.ticket_id ? 'new_case' : 'follow_up')
+                           : 'no_case',
+  });
+
+  return managerResult;
 }

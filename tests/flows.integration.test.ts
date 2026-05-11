@@ -9,7 +9,7 @@
 
 import { describe, it, expect, beforeAll, afterEach, beforeEach } from 'vitest';
 
-const BASE = 'http://localhost:3000';
+const BASE = 'https://zeni-chatbot-backend-cghtgyggdeckcygj.southeastasia-01.azurewebsites.net';
 let token  = '';
 
 // ─────────────────────────────────────────────────────────────────────────────
