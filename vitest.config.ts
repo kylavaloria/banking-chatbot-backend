@@ -7,5 +7,8 @@ export default defineConfig({
     testTimeout:  60_000,
     hookTimeout:  30_000,
     setupFiles:   ['./tests/setup.ts'],
+    typecheck: {
+      tsconfig: './tsconfig.test.json',
+    },
   },
 });
